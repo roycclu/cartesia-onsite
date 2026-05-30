@@ -3,3 +3,4 @@ __pycache__/
 insurance_demo.db
 .env
 .venv/
+*.pem
