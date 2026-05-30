@@ -79,11 +79,12 @@ def _load_explicit_parameters(client: object, loaded_any: bool) -> None:
     if not names:
         return
 
-    response = client.get_parameters(Names=names, WithDecryption=True)
-    for parameter in response.get("Parameters", []):
-        name = parameter["Name"].rsplit("/", 1)[-1]
-        if name in SSM_MANAGED_KEYS:
-            os.environ[name] = parameter["Value"]
+    for offset in range(0, len(names), 10):
+        response = client.get_parameters(Names=names[offset : offset + 10], WithDecryption=True)
+        for parameter in response.get("Parameters", []):
+            name = parameter["Name"].rsplit("/", 1)[-1]
+            if name in SSM_MANAGED_KEYS:
+                os.environ[name] = parameter["Value"]
 
 
 def _normalize_prefix(prefix: str) -> str:
