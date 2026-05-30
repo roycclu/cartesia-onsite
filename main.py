@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlencode
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,18 +23,23 @@ from config import load_runtime_env
 from db import close_db, database_status, init_db
 from orchestration import GraphState, InsuranceOrchestrator
 from tools import trigger_handoff
-from vad import TurnDetector
 
 
 logging.basicConfig(level=logging.DEBUG)
 
-STT_URL = "wss://api.cartesia.ai/stt/websocket"
+STT_URL = "wss://api.cartesia.ai/stt/turns/websocket"
 TTS_URL = "wss://api.cartesia.ai/tts/websocket"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
 APP_STARTED_AT = datetime.now(timezone.utc)
 logger = logging.getLogger("voice_agent")
 
 app = FastAPI(title="Insurance Voice Agent Demo", version="0.1.0")
+
+
+@dataclass
+class InkTurnStream:
+    websocket: Any
+    listener_task: asyncio.Task[None]
 
 
 class TextTurnRequest(BaseModel):
@@ -50,12 +56,9 @@ class SessionContext:
     policy_number: str | None = None
     ssn_last4: str | None = None
     history: list[dict[str, str]] = field(default_factory=list)
-    audio_buffer: bytearray = field(default_factory=bytearray)
-    silence_timeouts: int = 0
-    asr_failures: int = 0
     human_requests: int = 0
-    heard_speech_in_turn: bool = False
-    turn_detector: TurnDetector = field(default_factory=lambda: TurnDetector(sample_rate=8000))
+    ink_stream: InkTurnStream | None = None
+    twilio_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class CartesiaTranscriber:
@@ -63,37 +66,86 @@ class CartesiaTranscriber:
         self.api_key = os.getenv("CARTESIA_API_KEY")
         self.version = os.getenv("CARTESIA_VERSION", "2026-03-01")
 
-    async def transcribe(self, audio_bytes: bytes) -> dict[str, Any]:
+    async def open_twilio_turn_stream(self, session: SessionContext, websocket: WebSocket) -> InkTurnStream | None:
         if not self.api_key:
-            transcript = "<mock audio transcript unavailable>"
-            confidence = 0.25 if not audio_bytes else 0.9
-            return {"text": transcript, "confidence": confidence, "provider": "mock"}
+            logger.warning("cartesia_ink_unavailable session_id=%s reason=missing_api_key", session.session_id)
+            return None
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Cartesia-Version": self.version,
-        }
-        async with websockets.connect(STT_URL, additional_headers=headers, max_size=8_000_000) as ws:
-            await ws.send(audio_bytes)
-            await ws.send("finalize")
-            text_parts: list[str] = []
-            final_received = False
-            while True:
-                raw = await ws.recv()
+        headers = {"X-API-Key": self.api_key}
+        query = urlencode(
+            {
+                "model": "ink-2",
+                "encoding": "pcm_mulaw",
+                "sample_rate": "8000",
+                "cartesia_version": self.version,
+            }
+        )
+        stt_ws = await websockets.connect(f"{STT_URL}?{query}", additional_headers=headers, max_size=8_000_000)
+        listener_task = asyncio.create_task(self._consume_turn_events(stt_ws, websocket, session))
+        return InkTurnStream(websocket=stt_ws, listener_task=listener_task)
+
+    async def send_twilio_audio(self, stream: InkTurnStream | None, chunk: bytes) -> None:
+        if stream is None:
+            return
+        await stream.websocket.send(chunk)
+
+    async def close_turn_stream(self, session: SessionContext) -> None:
+        stream = session.ink_stream
+        session.ink_stream = None
+        if stream is None:
+            return
+        try:
+            await stream.websocket.send(json.dumps({"type": "close"}))
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stream.listener_task, timeout=2)
+        except Exception:
+            stream.listener_task.cancel()
+        try:
+            await stream.websocket.close()
+        except Exception:
+            pass
+
+    async def _consume_turn_events(self, stt_ws: Any, twilio_ws: WebSocket, session: SessionContext) -> None:
+        try:
+            async for raw in stt_ws:
                 if isinstance(raw, bytes):
                     continue
                 message = json.loads(raw)
-                if message.get("type") == "transcript":
-                    text_parts.append(message.get("text", ""))
-                    final_received = final_received or message.get("is_final", False)
-                if message.get("type") == "done":
-                    break
-                if message.get("type") == "error":
-                    raise RuntimeError(message.get("message", "Cartesia STT error"))
-            transcript = " ".join(part.strip() for part in text_parts if part.strip())
-            confidence = 0.9 if final_received and transcript else 0.35
-            await ws.send("close")
-            return {"text": transcript, "confidence": confidence, "provider": "cartesia"}
+                event_type = message.get("type")
+                logger.info(
+                    "cartesia_turn_event session_id=%s stream_sid=%s type=%s transcript=%s",
+                    session.session_id,
+                    session.stream_id,
+                    event_type,
+                    message.get("transcript"),
+                )
+                if event_type == "connected":
+                    await log_event(session.session_id, "cartesia_stt_connected", message)
+                    continue
+                if event_type == "turn.start":
+                    await log_event(session.session_id, "turn_start", message)
+                    continue
+                if event_type in {"turn.update", "turn.eager_end", "turn.resume"}:
+                    await log_event(session.session_id, event_type.replace(".", "_"), message)
+                    continue
+                if event_type == "turn.end":
+                    transcript = (message.get("transcript") or "").strip()
+                    await log_event(session.session_id, "asr_result", {"text": transcript, "provider": "cartesia_ink_2"})
+                    if transcript:
+                        result = await process_transcript(session, transcript)
+                        await send_agent_response(twilio_ws, session, result["response_text"], transport="twilio")
+                    continue
+                if event_type == "error":
+                    raise RuntimeError(message.get("message", "Cartesia Ink-2 error"))
+        except Exception as exc:
+            logger.exception(
+                "cartesia_turn_stream_exception session_id=%s stream_sid=%s",
+                session.session_id,
+                session.stream_id,
+            )
+            await fail_safe_handoff(twilio_ws, session, f"cartesia_turns_exception:{exc}", transport="twilio")
 
 
 class CartesiaTTS:
@@ -238,7 +290,7 @@ async def cartesia_stream(websocket: WebSocket, session_id: str) -> None:
                 event = json.loads(message["text"])
                 await handle_websocket_event(websocket, session, event)
             elif "bytes" in message and message["bytes"] is not None:
-                await handle_audio_chunk(websocket, session, message["bytes"])
+                logger.info("cartesia_raw_audio_ignored session_id=%s", session_id)
     except WebSocketDisconnect:
         await log_event(session_id, "call_disconnected", {"session_id": session_id})
     except Exception as exc:
@@ -251,7 +303,24 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
     session: SessionContext | None = None
     try:
         while True:
-            raw = await websocket.receive_text()
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                logger.info(
+                    "twilio_media_disconnect session_id=%s stream_sid=%s code=%s",
+                    session.session_id if session is not None else None,
+                    session.stream_id if session is not None else None,
+                    message.get("code"),
+                )
+                break
+            raw = message.get("text")
+            if raw is None:
+                logger.info(
+                    "twilio_media_nontext session_id=%s stream_sid=%s message_type=%s",
+                    session.session_id if session is not None else None,
+                    session.stream_id if session is not None else None,
+                    message["type"],
+                )
+                continue
             event = json.loads(raw)
             event_type = event.get("event")
 
@@ -266,8 +335,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 session = sessions.setdefault(session_id, SessionContext(session_id=session_id))
                 session.stream_id = event.get("streamSid")
                 session.call_sid = start.get("callSid")
-                session.turn_detector.sample_rate = 8000
-                session.turn_detector.reset()
+                session.ink_stream = await get_transcriber().open_twilio_turn_stream(session, websocket)
                 logger.info(
                     "twilio_media_start session_id=%s call_sid=%s stream_sid=%s",
                     session.session_id,
@@ -281,15 +349,13 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
             if event_type == "media" and session is not None:
                 payload = event["media"]["payload"]
                 mulaw_chunk = base64.b64decode(payload)
-                pcm_chunk = audioop.ulaw2lin(mulaw_chunk, 2)
                 logger.info(
-                    "twilio_media_chunk session_id=%s stream_sid=%s mulaw_bytes=%s pcm_bytes=%s",
+                    "twilio_media_chunk session_id=%s stream_sid=%s mulaw_bytes=%s",
                     session.session_id,
                     session.stream_id,
                     len(mulaw_chunk),
-                    len(pcm_chunk),
                 )
-                await handle_audio_chunk(websocket, session, pcm_chunk, transport="twilio")
+                await get_transcriber().send_twilio_audio(session.ink_stream, mulaw_chunk)
                 continue
 
             if event_type == "dtmf" and session is not None:
@@ -300,14 +366,10 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
             if event_type == "stop" and session is not None:
                 logger.info("twilio_media_stop session_id=%s stream_sid=%s", session.session_id, session.stream_id)
                 await log_event(session.session_id, "twilio_stream_stop", event)
+                await get_transcriber().close_turn_stream(session)
                 break
-    except WebSocketDisconnect:
-        logger.info(
-            "twilio_media_disconnect session_id=%s stream_sid=%s",
-            session.session_id if session is not None else None,
-            session.stream_id if session is not None else None,
-        )
         if session is not None:
+            await get_transcriber().close_turn_stream(session)
             await log_event(session.session_id, "twilio_disconnect", {"session_id": session.session_id})
     except Exception as exc:
         logger.exception(
@@ -316,6 +378,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
             session.stream_id if session is not None else None,
         )
         if session is not None:
+            await get_transcriber().close_turn_stream(session)
             await fail_safe_handoff(websocket, session, f"twilio_exception:{exc}", transport="twilio")
         else:
             await websocket.close(code=1011)
@@ -325,13 +388,11 @@ async def handle_websocket_event(websocket: WebSocket, session: SessionContext, 
     event_type = event.get("event")
     if event_type == "start":
         session.stream_id = event.get("stream_id") or str(uuid.uuid4())
-        session.turn_detector.reset()
         await log_event(session.session_id, "stream_start", event)
         await websocket.send_json({"event": "ack", "stream_id": session.stream_id, "config": event.get("config", {})})
         return
     if event_type == "media_input":
-        payload = base64.b64decode(event["media"]["payload"])
-        await handle_audio_chunk(websocket, session, payload)
+        logger.info("cartesia_media_input_ignored session_id=%s", session.session_id)
         return
     if event_type == "custom" and event.get("metadata", {}).get("transcript"):
         result = await process_transcript(session, event["metadata"]["transcript"])
@@ -341,46 +402,6 @@ async def handle_websocket_event(websocket: WebSocket, session: SessionContext, 
         await log_event(session.session_id, "dtmf", event)
         return
     raise HTTPException(status_code=400, detail=f"Unsupported event: {event_type}")
-
-
-async def handle_audio_chunk(websocket: WebSocket, session: SessionContext, chunk: bytes, transport: str = "cartesia") -> None:
-    vad_result = session.turn_detector.ingest(chunk)
-    if vad_result.speech_detected:
-        session.heard_speech_in_turn = True
-        session.silence_timeouts = 0
-    if session.heard_speech_in_turn:
-        session.audio_buffer.extend(chunk)
-    if vad_result.end_of_turn:
-        if not session.heard_speech_in_turn:
-            session.turn_detector.reset()
-            await handle_silence_timeout(websocket, session, transport=transport)
-            return
-        audio = bytes(session.audio_buffer)
-        session.audio_buffer.clear()
-        session.heard_speech_in_turn = False
-        session.turn_detector.reset()
-        asr_result = await get_transcriber().transcribe(audio)
-        await log_event(session.session_id, "asr_result", asr_result)
-        if asr_result["confidence"] < 0.6:
-            session.asr_failures += 1
-            if session.asr_failures >= 2:
-                await fail_safe_handoff(websocket, session, "asr_low_confidence", transport=transport)
-            else:
-                await send_agent_response(websocket, session, "I didn’t catch that clearly. Please repeat your request.", transport=transport)
-            return
-        session.asr_failures = 0
-        result = await process_transcript(session, asr_result["text"])
-        await send_agent_response(websocket, session, result["response_text"], transport=transport)
-
-
-async def handle_silence_timeout(websocket: WebSocket, session: SessionContext, transport: str = "cartesia") -> None:
-    session.silence_timeouts += 1
-    session.heard_speech_in_turn = False
-    session.audio_buffer.clear()
-    if session.silence_timeouts >= 2:
-        await fail_safe_handoff(websocket, session, "silence_timeout", transport=transport)
-        return
-    await send_agent_response(websocket, session, "I’m still here. Please let me know how I can help with your insurance policy or claim.", transport=transport)
 
 
 async def process_transcript(session: SessionContext, transcript: str) -> GraphState:
@@ -442,17 +463,25 @@ async def send_agent_response(websocket: WebSocket, session: SessionContext, tex
 async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reason: str, transport: str = "cartesia") -> None:
     payload = await trigger_handoff(session.session_id, reason, "Automatic fallback handoff")
     if transport == "twilio":
-        await send_twilio_response(websocket, session, "I’m transferring you to a human representative.")
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "event": "mark",
-                    "streamSid": session.stream_id,
-                    "mark": {"name": payload["reason_code"]},
-                }
+        try:
+            await send_twilio_response(websocket, session, "I’m transferring you to a human representative.")
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "event": "mark",
+                        "streamSid": session.stream_id,
+                        "mark": {"name": payload["reason_code"]},
+                    }
+                )
             )
-        )
-        await websocket.close(code=1000)
+            await websocket.close(code=1000)
+        except RuntimeError:
+            logger.info(
+                "twilio_handoff_socket_closed session_id=%s stream_sid=%s reason=%s",
+                session.session_id,
+                session.stream_id,
+                payload["reason_code"],
+            )
         return
     await websocket.send_json(
         {
@@ -467,29 +496,30 @@ async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reaso
 
 
 async def send_twilio_response(websocket: WebSocket, session: SessionContext, text: str) -> None:
-    audio_chunks = await get_tts().synthesize(session.session_id, text)
-    for chunk in audio_chunks:
-        pcm_chunk = base64.b64decode(chunk)
-        mulaw_chunk = audioop.lin2ulaw(pcm_chunk, 2)
-        payload = base64.b64encode(mulaw_chunk).decode("utf-8")
+    async with session.twilio_send_lock:
+        audio_chunks = await get_tts().synthesize(session.session_id, text)
+        for chunk in audio_chunks:
+            pcm_chunk = base64.b64decode(chunk)
+            mulaw_chunk = audioop.lin2ulaw(pcm_chunk, 2)
+            payload = base64.b64encode(mulaw_chunk).decode("utf-8")
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "event": "media",
+                        "streamSid": session.stream_id,
+                        "media": {"payload": payload},
+                    }
+                )
+            )
         await websocket.send_text(
             json.dumps(
                 {
-                    "event": "media",
+                    "event": "mark",
                     "streamSid": session.stream_id,
-                    "media": {"payload": payload},
+                    "mark": {"name": f"response-{uuid.uuid4()}"},
                 }
             )
         )
-    await websocket.send_text(
-        json.dumps(
-            {
-                "event": "mark",
-                "streamSid": session.stream_id,
-                "mark": {"name": f"response-{uuid.uuid4()}"},
-            }
-        )
-    )
 
 
 def build_twilio_stream_url(request: Request) -> str:

@@ -1,6 +1,6 @@
 # Insurance Voice Agent Demo
 
-This prototype is a FastAPI-based voice AI demo for an insurance call center. It accepts streaming call input, detects turn endings with VAD, transcribes speech, routes each turn through a LangGraph workflow, queries a seeded PostgreSQL insurance database, and returns spoken responses. It also logs compliance events and defaults to human handoff on failures.
+This prototype is a FastAPI-based voice AI demo for an insurance call center. It accepts streaming call input, transcribes speech with Cartesia Ink-2 turn detection, routes each completed turn through a LangGraph workflow, queries a seeded PostgreSQL insurance database, and returns spoken responses. It also logs compliance events and defaults to human handoff on failures.
 
 It now supports two ingress paths:
 
@@ -20,7 +20,7 @@ Production-facing pieces in this prototype:
 
 - FastAPI app structure for inbound call/session handling.
 - WebSocket envelope compatible with Cartesia's current Calls API pattern.
-- Cartesia Ink STT WebSocket integration path.
+- Cartesia Ink-2 turn-based STT WebSocket integration path.
 - Cartesia Sonic TTS WebSocket integration path.
 - LangGraph orchestration with intent classification, tool execution, and response generation nodes.
 - Append-only compliance logging.
@@ -34,14 +34,13 @@ Core files:
 - [tools.py](/home/roy/cartesia_onsite/tools.py): Read-only insurance tools, identity verification, and handoff logging.
 - [db.py](/home/roy/cartesia_onsite/db.py): PostgreSQL schema, seeding, and query helpers.
 - [compliance.py](/home/roy/cartesia_onsite/compliance.py): Append-only compliance log helpers.
-- [vad.py](/home/roy/cartesia_onsite/vad.py): Silero-first VAD wrapper with an RMS fallback when `silero_vad` is unavailable.
 
 Call flow:
 
 1. Client starts a call session with `POST /calls/start` or directly opens `ws://.../ws/cartesia/{session_id}`.
 2. Audio chunks arrive as WebSocket `media_input` events or raw bytes.
-3. VAD marks end-of-turn after silence accumulation.
-4. Audio is transcribed with Cartesia Ink STT.
+3. Twilio telephony streams raw `mulaw` audio directly to Cartesia Ink-2, which handles VAD and turn detection internally.
+4. Completed user turns are transcribed with Cartesia Ink-2 STT.
 5. LangGraph runs `intent_classification -> tool_execution -> response_generation`.
 6. Tool calls hit the PostgreSQL mock DB only after identity verification passes.
 7. Response text is synthesized through Cartesia Sonic TTS and streamed back as `media_output`.
@@ -49,8 +48,6 @@ Call flow:
 
 ## Edge Cases Covered
 
-- Two silence timeouts trigger a prompt, then handoff.
-- Two low-confidence ASR results trigger handoff.
 - Two human requests trigger immediate handoff.
 - Out-of-scope or write requests trigger handoff.
 - LLM errors trigger fallback messaging plus handoff.
@@ -63,13 +60,7 @@ Call flow:
 The environment used for this prototype already had the core packages, but a clean environment should install:
 
 ```bash
-pip install fastapi uvicorn langgraph openai websockets numpy torch onnxruntime
-```
-
-Optional for true Silero VAD support:
-
-```bash
-pip install silero-vad
+pip install fastapi uvicorn langgraph openai websockets
 ```
 
 ### 2. Set environment variables
@@ -178,7 +169,7 @@ wss://your-public-domain.example.com/ws/twilio-media
 
 Important notes for Twilio:
 
-- Twilio Media Streams uses `audio/x-mulaw` at 8 kHz. The app converts inbound `mulaw` to PCM for VAD/STT and converts TTS PCM back to `mulaw` for playback.
+- Twilio Media Streams uses `audio/x-mulaw` at 8 kHz. The app forwards inbound `mulaw` directly to Cartesia Ink-2 STT and converts TTS PCM back to `mulaw` for playback.
 - Live spoken responses require `CARTESIA_API_KEY` because the mock TTS path only emits silence for telephony testing.
 - For a real phone demo, set your Twilio number webhook after the app is reachable over public HTTPS/WSS.
 
@@ -191,7 +182,7 @@ Important notes for Twilio:
 ## Tradeoffs
 
 - The telephony bridge is demo-focused. It mirrors Cartesia's current WebSocket call event shape rather than implementing a full production phone provider bridge.
-- The VAD layer prefers Silero but falls back to RMS energy detection so the prototype stays runnable in restricted environments.
+- Turn detection relies on Cartesia Ink-2 rather than a local VAD layer, which simplifies the telephony pipeline but couples turn timing to the STT provider.
 - The orchestration graph is intentionally narrow: three nodes only, matching the spec and keeping behavior easy to inspect.
 - The compliance logger is append-only and enforced at the PostgreSQL table level.
 
@@ -209,7 +200,7 @@ Important notes for Twilio:
 ## Cartesia Docs Used
 
 - Calls/WebSocket API: https://docs.cartesia.ai/line/integrations/websocket-api
-- STT WebSocket API: https://docs.cartesia.ai/api-reference/stt/stt
+- STT Turns WebSocket API: https://docs.cartesia.ai/api-reference/stt/turns/websocket
 - TTS WebSocket API: https://docs.cartesia.ai/api-reference/tts/websocket
 
 ## Word Export
