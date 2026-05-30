@@ -6,6 +6,7 @@ import audioop
 from datetime import datetime, timezone
 from html import escape
 import json
+import logging
 import os
 from pathlib import Path
 import uuid
@@ -24,10 +25,13 @@ from tools import trigger_handoff
 from vad import TurnDetector
 
 
+logging.basicConfig(level=logging.DEBUG)
+
 STT_URL = "wss://api.cartesia.ai/stt/websocket"
 TTS_URL = "wss://api.cartesia.ai/tts/websocket"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
 APP_STARTED_AT = datetime.now(timezone.utc)
+logger = logging.getLogger("voice_agent")
 
 app = FastAPI(title="Insurance Voice Agent Demo", version="0.1.0")
 
@@ -252,6 +256,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
             event_type = event.get("event")
 
             if event_type == "connected":
+                logger.info("twilio_media_connected")
                 continue
 
             if event_type == "start":
@@ -263,6 +268,12 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 session.call_sid = start.get("callSid")
                 session.turn_detector.sample_rate = 8000
                 session.turn_detector.reset()
+                logger.info(
+                    "twilio_media_start session_id=%s call_sid=%s stream_sid=%s",
+                    session.session_id,
+                    session.call_sid,
+                    session.stream_id,
+                )
                 await log_event(session.session_id, "twilio_stream_start", event)
                 await send_twilio_response(websocket, session, "Thanks for calling. Please share your policy number and the last four digits of your Social Security number.")
                 continue
@@ -271,20 +282,39 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 payload = event["media"]["payload"]
                 mulaw_chunk = base64.b64decode(payload)
                 pcm_chunk = audioop.ulaw2lin(mulaw_chunk, 2)
+                logger.info(
+                    "twilio_media_chunk session_id=%s stream_sid=%s mulaw_bytes=%s pcm_bytes=%s",
+                    session.session_id,
+                    session.stream_id,
+                    len(mulaw_chunk),
+                    len(pcm_chunk),
+                )
                 await handle_audio_chunk(websocket, session, pcm_chunk, transport="twilio")
                 continue
 
             if event_type == "dtmf" and session is not None:
+                logger.info("twilio_dtmf session_id=%s stream_sid=%s", session.session_id, session.stream_id)
                 await log_event(session.session_id, "twilio_dtmf", event)
                 continue
 
             if event_type == "stop" and session is not None:
+                logger.info("twilio_media_stop session_id=%s stream_sid=%s", session.session_id, session.stream_id)
                 await log_event(session.session_id, "twilio_stream_stop", event)
                 break
     except WebSocketDisconnect:
+        logger.info(
+            "twilio_media_disconnect session_id=%s stream_sid=%s",
+            session.session_id if session is not None else None,
+            session.stream_id if session is not None else None,
+        )
         if session is not None:
             await log_event(session.session_id, "twilio_disconnect", {"session_id": session.session_id})
     except Exception as exc:
+        logger.exception(
+            "twilio_media_exception session_id=%s stream_sid=%s",
+            session.session_id if session is not None else None,
+            session.stream_id if session is not None else None,
+        )
         if session is not None:
             await fail_safe_handoff(websocket, session, f"twilio_exception:{exc}", transport="twilio")
         else:
