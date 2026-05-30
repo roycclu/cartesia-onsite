@@ -9,8 +9,8 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, StateGraph
 from openai import AsyncOpenAI
 
-from compliance import log_event
-from tools import get_claim_status, get_policy_info, normalize_policy_number, trigger_handoff, verify_identity
+from app.compliance import log_event
+from app.tools import get_claim_status, get_policy_info, normalize_policy_number, trigger_handoff, verify_identity
 
 logger = logging.getLogger("voice_agent")
 

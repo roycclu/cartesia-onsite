@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from db import dump_json, execute, fetch_all
+from app.db import dump_json, execute, fetch_all
 
 
 def utc_now_iso() -> str:

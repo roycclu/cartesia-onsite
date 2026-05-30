@@ -18,11 +18,11 @@ from fastapi import FastAPI, Form, HTTPException, Request, Response, WebSocket, 
 from pydantic import BaseModel
 import websockets
 
-from compliance import get_session_log, log_event
-from config import load_runtime_env
-from db import close_db, database_status, init_db
-from orchestration import GraphState, InsuranceOrchestrator
-from tools import trigger_handoff
+from app.compliance import get_session_log, log_event
+from app.config import load_runtime_env
+from app.db import close_db, database_status, init_db
+from app.orchestration import GraphState, InsuranceOrchestrator
+from app.tools import trigger_handoff
 
 
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +32,7 @@ logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 STT_URL = "wss://api.cartesia.ai/stt/turns/websocket"
 TTS_URL = "wss://api.cartesia.ai/tts/websocket"
-VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
 APP_STARTED_AT = datetime.now(timezone.utc)
 logger = logging.getLogger("voice_agent")
 
@@ -564,4 +564,4 @@ def get_tts() -> CartesiaTTS:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
