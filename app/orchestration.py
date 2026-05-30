@@ -15,7 +15,7 @@ from app.tools import get_claim_status, get_policy_info, normalize_policy_number
 logger = logging.getLogger("voice_agent")
 
 SSN_PATTERN = re.compile(r"\b(\d{4})\b")
-POLICY_PATTERN = re.compile(r"\b([A-Z]{2,4}\d?)[-\s]?(\d{3,4})\b", re.IGNORECASE)
+POLICY_PATTERN = re.compile(r"\b([A-Z]{2,4}\d?)[-\s]?([0-9OoIi]{3,4})\b", re.IGNORECASE)
 SSN_CONTEXT_PATTERN = re.compile(
     r"(?:ssn|social security number|last four(?: digits)?)\D*(\d{4})",
     re.IGNORECASE,
@@ -316,17 +316,40 @@ class InsuranceOrchestrator:
 
 
 def extract_fields(transcript: str) -> dict[str, str | None]:
-    policy_match = POLICY_PATTERN.search(transcript)
+    lower = transcript.lower()
+
+    # Only search for policy number in the portion before any SSN keyword.
+    # Without this, the regex can match the SSN digits against a preceding
+    # word (e.g. "is 4821") and normalize_policy_number turns it into POL4821.
+    split_at = len(transcript)
+    for kw in ("social", "ssn", "last four"):
+        idx = lower.find(kw)
+        if idx != -1:
+            split_at = min(split_at, idx)
+    policy_section = transcript[:split_at]
+
+    # Collapse intra-word hyphens so STT artifacts like "POL1O-O1" → "POL1OO1"
+    # before the digit pattern runs.
+    policy_section_clean = re.sub(r"(?<=[A-Za-z0-9])-(?=[A-Za-z0-9])", "", policy_section)
+
     policy_number = None
+    policy_match = POLICY_PATTERN.search(policy_section_clean)
     if policy_match:
-        policy_number = normalize_policy_number(f"{policy_match.group(1)}{policy_match.group(2)}")
+        prefix = policy_match.group(1).upper()
+        # Normalize common STT confusions in digit positions: O→0, I→1
+        digits = policy_match.group(2).upper().replace("O", "0").replace("I", "1")
+        policy_number = normalize_policy_number(f"{prefix}{digits}")
 
     ssn_match = SSN_CONTEXT_PATTERN.search(transcript)
     if ssn_match:
         ssn_last4 = ssn_match.group(1)
-    else:
+    elif any(kw in lower for kw in ("ssn", "last four", "social")):
+        # Only fall back to bare-digit search when an SSN keyword was spoken,
+        # otherwise the policy digits get grabbed as the SSN.
         fallback_matches = SSN_PATTERN.findall(transcript)
         ssn_last4 = fallback_matches[-1] if fallback_matches else None
+    else:
+        ssn_last4 = None
 
     return {
         "policy_number": policy_number,
