@@ -1,53 +1,89 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-import sqlite3
+import os
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parent / "insurance_demo.db"
+import asyncpg
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS claims (
-    claim_id TEXT PRIMARY KEY,
-    policy_number TEXT NOT NULL,
-    status TEXT NOT NULL,
-    last_updated TEXT NOT NULL,
-    adjuster_name TEXT NOT NULL
-);
+DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@postgres:5432/voice_agent"
 
-CREATE TABLE IF NOT EXISTS policies (
-    policy_number TEXT PRIMARY KEY,
-    holder_name TEXT NOT NULL,
-    coverage_type TEXT NOT NULL,
-    coverage_limit INTEGER NOT NULL,
-    deductible INTEGER NOT NULL,
-    effective_date TEXT NOT NULL
-);
+pool: asyncpg.Pool | None = None
 
-CREATE TABLE IF NOT EXISTS verification (
-    policy_number TEXT PRIMARY KEY,
-    ssn_last4 TEXT NOT NULL,
-    holder_name TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS handoff_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    reason_code TEXT NOT NULL,
-    transcript_summary TEXT NOT NULL,
-    timestamp TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS compliance_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    timestamp TEXT NOT NULL
-);
-"""
+SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS claims (
+        claim_id TEXT PRIMARY KEY,
+        policy_number TEXT NOT NULL,
+        status TEXT NOT NULL,
+        last_updated TEXT NOT NULL,
+        adjuster_name TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS policies (
+        policy_number TEXT PRIMARY KEY,
+        holder_name TEXT NOT NULL,
+        coverage_type TEXT NOT NULL,
+        coverage_limit INTEGER NOT NULL,
+        deductible INTEGER NOT NULL,
+        effective_date TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS verification (
+        policy_number TEXT PRIMARY KEY,
+        ssn_last4 TEXT NOT NULL,
+        holder_name TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS handoff_queue (
+        id BIGSERIAL PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        transcript_summary TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS compliance_log (
+        id BIGSERIAL PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE OR REPLACE FUNCTION prevent_compliance_log_mutation()
+    RETURNS trigger AS $$
+    BEGIN
+        RAISE EXCEPTION 'compliance_log is append-only';
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+    """
+    DROP TRIGGER IF EXISTS compliance_log_no_update ON compliance_log
+    """,
+    """
+    CREATE TRIGGER compliance_log_no_update
+    BEFORE UPDATE ON compliance_log
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_compliance_log_mutation()
+    """,
+    """
+    DROP TRIGGER IF EXISTS compliance_log_no_delete ON compliance_log
+    """,
+    """
+    CREATE TRIGGER compliance_log_no_delete
+    BEFORE DELETE ON compliance_log
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_compliance_log_mutation()
+    """,
+]
 
 
 SEED_POLICIES = [
@@ -75,66 +111,96 @@ SEED_VERIFICATION = [
 ]
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 async def init_db() -> None:
-    _init_db_sync()
+    await ensure_pool()
+    assert pool is not None
+    async with pool.acquire() as conn:
+        for statement in SCHEMA_STATEMENTS:
+            await conn.execute(statement)
+        await _seed_reference_data(conn)
 
 
-async def fetch_one(query: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
-    return _fetch_one_sync(query, params)
+async def close_db() -> None:
+    global pool
+    if pool is not None:
+        await pool.close()
+        pool = None
+
+
+async def database_status() -> str:
+    try:
+        await fetch_value("SELECT 1")
+    except Exception:
+        return "unavailable"
+    return "ok"
+
+
+async def fetch_one(query: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+    db_pool = await ensure_pool()
+    row = await db_pool.fetchrow(query, *params)
+    return dict(row) if row else None
 
 
 async def fetch_all(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-    return _fetch_all_sync(query, params)
+    db_pool = await ensure_pool()
+    rows = await db_pool.fetch(query, *params)
+    return [dict(row) for row in rows]
 
 
-async def execute(query: str, params: tuple[Any, ...]) -> None:
-    _execute_sync(query, params)
+async def fetch_value(query: str, params: tuple[Any, ...] = ()) -> Any:
+    db_pool = await ensure_pool()
+    return await db_pool.fetchval(query, *params)
+
+
+async def execute(query: str, params: tuple[Any, ...] = ()) -> str:
+    db_pool = await ensure_pool()
+    return await db_pool.execute(query, *params)
 
 
 def dump_json(data: Any) -> str:
     return json.dumps(data, sort_keys=True, default=str)
 
 
-def _init_db_sync() -> None:
-    with get_connection() as conn:
-        conn.executescript(SCHEMA)
-        conn.execute("DELETE FROM claims")
-        conn.execute("DELETE FROM policies")
-        conn.execute("DELETE FROM verification")
-        conn.executemany(
-            "INSERT INTO policies(policy_number, holder_name, coverage_type, coverage_limit, deductible, effective_date) VALUES (?, ?, ?, ?, ?, ?)",
-            SEED_POLICIES,
-        )
-        conn.executemany(
-            "INSERT INTO claims(claim_id, policy_number, status, last_updated, adjuster_name) VALUES (?, ?, ?, ?, ?)",
-            SEED_CLAIMS,
-        )
-        conn.executemany(
-            "INSERT INTO verification(policy_number, ssn_last4, holder_name) VALUES (?, ?, ?)",
-            SEED_VERIFICATION,
-        )
-        conn.commit()
+async def ensure_pool() -> asyncpg.Pool:
+    global pool
+    if pool is None:
+        pool = await asyncpg.create_pool(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL), min_size=1, max_size=5)
+    return pool
 
 
-def _fetch_one_sync(query: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
-    with get_connection() as conn:
-        row = conn.execute(query, params).fetchone()
-        return dict(row) if row else None
-
-
-def _fetch_all_sync(query: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-
-
-def _execute_sync(query: str, params: tuple[Any, ...]) -> None:
-    with get_connection() as conn:
-        conn.execute(query, params)
-        conn.commit()
+async def _seed_reference_data(conn: asyncpg.Connection) -> None:
+    await conn.executemany(
+        """
+        INSERT INTO policies(policy_number, holder_name, coverage_type, coverage_limit, deductible, effective_date)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (policy_number) DO UPDATE SET
+            holder_name = EXCLUDED.holder_name,
+            coverage_type = EXCLUDED.coverage_type,
+            coverage_limit = EXCLUDED.coverage_limit,
+            deductible = EXCLUDED.deductible,
+            effective_date = EXCLUDED.effective_date
+        """,
+        SEED_POLICIES,
+    )
+    await conn.executemany(
+        """
+        INSERT INTO claims(claim_id, policy_number, status, last_updated, adjuster_name)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (claim_id) DO UPDATE SET
+            policy_number = EXCLUDED.policy_number,
+            status = EXCLUDED.status,
+            last_updated = EXCLUDED.last_updated,
+            adjuster_name = EXCLUDED.adjuster_name
+        """,
+        SEED_CLAIMS,
+    )
+    await conn.executemany(
+        """
+        INSERT INTO verification(policy_number, ssn_last4, holder_name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (policy_number) DO UPDATE SET
+            ssn_last4 = EXCLUDED.ssn_last4,
+            holder_name = EXCLUDED.holder_name
+        """,
+        SEED_VERIFICATION,
+    )

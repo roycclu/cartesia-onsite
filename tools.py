@@ -8,7 +8,7 @@ from db import execute, fetch_one
 
 async def verify_identity(session_id: str, policy_number: str, ssn_last4: str) -> dict[str, Any]:
     record = await fetch_one(
-        "SELECT policy_number, ssn_last4, holder_name FROM verification WHERE policy_number = ?",
+        "SELECT policy_number, ssn_last4, holder_name FROM verification WHERE policy_number = $1",
         (policy_number,),
     )
     result = {
@@ -22,7 +22,7 @@ async def verify_identity(session_id: str, policy_number: str, ssn_last4: str) -
 
 async def get_claim_status(session_id: str, policy_number: str) -> dict[str, Any]:
     claim = await fetch_one(
-        "SELECT claim_id, policy_number, status, last_updated, adjuster_name FROM claims WHERE policy_number = ?",
+        "SELECT claim_id, policy_number, status, last_updated, adjuster_name FROM claims WHERE policy_number = $1",
         (policy_number,),
     )
     await log_event(session_id, "tool_call", {"tool": "get_claim_status", "policy_number": policy_number, "result": claim})
@@ -31,7 +31,7 @@ async def get_claim_status(session_id: str, policy_number: str) -> dict[str, Any
 
 async def get_policy_info(session_id: str, policy_number: str) -> dict[str, Any]:
     policy = await fetch_one(
-        "SELECT policy_number, holder_name, coverage_type, coverage_limit, deductible, effective_date FROM policies WHERE policy_number = ?",
+        "SELECT policy_number, holder_name, coverage_type, coverage_limit, deductible, effective_date FROM policies WHERE policy_number = $1",
         (policy_number,),
     )
     await log_event(session_id, "tool_call", {"tool": "get_policy_info", "policy_number": policy_number, "result": policy})
@@ -46,7 +46,7 @@ async def trigger_handoff(session_id: str, reason: str, transcript_summary: str)
         "timestamp": utc_now_iso(),
     }
     await execute(
-        "INSERT INTO handoff_queue(session_id, reason_code, transcript_summary, timestamp) VALUES (?, ?, ?, ?)",
+        "INSERT INTO handoff_queue(session_id, reason_code, transcript_summary, timestamp) VALUES ($1, $2, $3, $4)",
         (payload["session_id"], payload["reason_code"], payload["transcript_summary"], payload["timestamp"]),
     )
     await log_event(session_id, "handoff", payload)

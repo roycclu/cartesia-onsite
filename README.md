@@ -1,6 +1,6 @@
 # Insurance Voice Agent Demo
 
-This prototype is a FastAPI-based voice AI demo for an insurance call center. It accepts streaming call input, detects turn endings with VAD, transcribes speech, routes each turn through a LangGraph workflow, queries a seeded SQLite insurance database, and returns spoken responses. It also logs compliance events and defaults to human handoff on failures.
+This prototype is a FastAPI-based voice AI demo for an insurance call center. It accepts streaming call input, detects turn endings with VAD, transcribes speech, routes each turn through a LangGraph workflow, queries a seeded PostgreSQL insurance database, and returns spoken responses. It also logs compliance events and defaults to human handoff on failures.
 
 It now supports two ingress paths:
 
@@ -11,7 +11,7 @@ It now supports two ingress paths:
 
 Mocked in this repo:
 
-- The insurance data store uses local SQLite with seeded fake records.
+- The insurance data store uses PostgreSQL with seeded fake records.
 - Identity verification uses a mock `verification` table with policy number plus SSN last 4.
 - If `CARTESIA_API_KEY` is missing, STT and TTS fall back to mock behavior so the demo still runs.
 - LLM behavior falls back to deterministic rules when `OPENAI_API_KEY` is missing.
@@ -32,7 +32,7 @@ Core files:
 - [main.py](/home/roy/cartesia_onsite/main.py): FastAPI app, session lifecycle, WebSocket/audio flow, mock text-turn endpoint.
 - [orchestration.py](/home/roy/cartesia_onsite/orchestration.py): LangGraph state machine and fallback LLM helpers.
 - [tools.py](/home/roy/cartesia_onsite/tools.py): Read-only insurance tools, identity verification, and handoff logging.
-- [db.py](/home/roy/cartesia_onsite/db.py): SQLite schema, seeding, and query helpers.
+- [db.py](/home/roy/cartesia_onsite/db.py): PostgreSQL schema, seeding, and query helpers.
 - [compliance.py](/home/roy/cartesia_onsite/compliance.py): Append-only compliance log helpers.
 - [vad.py](/home/roy/cartesia_onsite/vad.py): Silero-first VAD wrapper with an RMS fallback when `silero_vad` is unavailable.
 
@@ -43,7 +43,7 @@ Call flow:
 3. VAD marks end-of-turn after silence accumulation.
 4. Audio is transcribed with Cartesia Ink STT.
 5. LangGraph runs `intent_classification -> tool_execution -> response_generation`.
-6. Tool calls hit the SQLite mock DB only after identity verification passes.
+6. Tool calls hit the PostgreSQL mock DB only after identity verification passes.
 7. Response text is synthesized through Cartesia Sonic TTS and streamed back as `media_output`.
 8. Compliance events are appended through the full path.
 
@@ -78,6 +78,10 @@ For full external integrations:
 
 ```bash
 export CARTESIA_API_KEY=...
+export TWILIO_ACCOUNT_SID=...
+export TWILIO_AUTH_TOKEN=...
+export DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/voice_agent
+export AWS_REGION=us-east-1
 export CARTESIA_VOICE_ID=...
 export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-4o-mini
@@ -86,16 +90,27 @@ export HUMAN_HANDOFF_NUMBER=+15555550199
 
 If you skip the API keys, the app still runs in mock mode.
 
+Local startup loads `.env` automatically when `AWS_EXECUTION_ENV` is not set.
+
+On AWS, startup skips `.env` and loads configuration from SSM Parameter Store instead. The app expects parameters under `SSM_PARAMETER_PREFIX` and maps names directly, for example:
+
+```text
+/voice-agent-demo/CARTESIA_API_KEY
+/voice-agent-demo/TWILIO_ACCOUNT_SID
+/voice-agent-demo/TWILIO_AUTH_TOKEN
+/voice-agent-demo/DATABASE_URL
+```
+
 ### 3. Start the server
 
 ```bash
-python main.py
+docker compose up --build
 ```
 
 Or:
 
 ```bash
-uvicorn main:app --reload
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ### 4. Try the text demo path
@@ -167,16 +182,22 @@ Important notes for Twilio:
 - Live spoken responses require `CARTESIA_API_KEY` because the mock TTS path only emits silence for telephony testing.
 - For a real phone demo, set your Twilio number webhook after the app is reachable over public HTTPS/WSS.
 
+## AWS Deployment
+
+- `deploy/buildspec.yml` builds the image in CodeBuild, writes the current commit hash into `VERSION`, and pushes both `latest` and the commit-tagged image to ECR.
+- `deploy/taskdef.json` defines a Fargate task sized at 1 vCPU and 2 GB RAM for ECS and passes `AWS_REGION` plus `SSM_PARAMETER_PREFIX` so the app can load runtime secrets from SSM Parameter Store.
+- `deploy/deploy.sh` builds locally, tags the image with `git rev-parse HEAD`, pushes to `voice-agent-demo` in `us-east-1`, registers a new task definition revision, and updates the ECS service.
+
 ## Tradeoffs
 
 - The telephony bridge is demo-focused. It mirrors Cartesia's current WebSocket call event shape rather than implementing a full production phone provider bridge.
 - The VAD layer prefers Silero but falls back to RMS energy detection so the prototype stays runnable in restricted environments.
 - The orchestration graph is intentionally narrow: three nodes only, matching the spec and keeping behavior easy to inspect.
-- The compliance logger uses SQLite rather than PostgreSQL to reduce setup overhead.
+- The compliance logger is append-only and enforced at the PostgreSQL table level.
 
 ## What Changes for a Real VPC Deployment
 
-- Replace SQLite with managed PostgreSQL and move compliance/handoff logs into separate audited schemas.
+- Move the demo PostgreSQL schema into managed RDS/PostgreSQL and split compliance/handoff logs into separate audited schemas.
 - Run a dedicated media gateway for telephony provider bridging and jitter buffering.
 - Store call audio and transcripts in durable object storage.
 - Add auth around all operational endpoints.

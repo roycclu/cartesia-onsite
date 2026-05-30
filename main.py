@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import audioop
+from datetime import datetime, timezone
 from html import escape
 import json
 import os
+from pathlib import Path
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,16 +17,17 @@ from pydantic import BaseModel
 import websockets
 
 from compliance import get_session_log, log_event
-from db import init_db
+from config import load_runtime_env
+from db import close_db, database_status, init_db
 from orchestration import GraphState, InsuranceOrchestrator
 from tools import trigger_handoff
 from vad import TurnDetector
 
 
-CARTESIA_VERSION = os.getenv("CARTESIA_VERSION", "2026-03-01")
 STT_URL = "wss://api.cartesia.ai/stt/websocket"
 TTS_URL = "wss://api.cartesia.ai/tts/websocket"
-DEFAULT_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091")
+VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+APP_STARTED_AT = datetime.now(timezone.utc)
 
 app = FastAPI(title="Insurance Voice Agent Demo", version="0.1.0")
 
@@ -54,6 +57,7 @@ class SessionContext:
 class CartesiaTranscriber:
     def __init__(self) -> None:
         self.api_key = os.getenv("CARTESIA_API_KEY")
+        self.version = os.getenv("CARTESIA_VERSION", "2026-03-01")
 
     async def transcribe(self, audio_bytes: bytes) -> dict[str, Any]:
         if not self.api_key:
@@ -63,7 +67,7 @@ class CartesiaTranscriber:
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Cartesia-Version": CARTESIA_VERSION,
+            "Cartesia-Version": self.version,
         }
         async with websockets.connect(STT_URL, additional_headers=headers, max_size=8_000_000) as ws:
             await ws.send(audio_bytes)
@@ -91,7 +95,8 @@ class CartesiaTranscriber:
 class CartesiaTTS:
     def __init__(self) -> None:
         self.api_key = os.getenv("CARTESIA_API_KEY")
-        self.voice_id = DEFAULT_VOICE_ID
+        self.version = os.getenv("CARTESIA_VERSION", "2026-03-01")
+        self.voice_id = os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091")
 
     async def synthesize(self, session_id: str, text: str) -> list[str]:
         if not self.api_key:
@@ -99,7 +104,7 @@ class CartesiaTTS:
             return [base64.b64encode(silence).decode("utf-8")]
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Cartesia-Version": CARTESIA_VERSION,
+            "Cartesia-Version": self.version,
         }
         payload = {
             "model_id": "sonic-latest",
@@ -128,19 +133,34 @@ class CartesiaTTS:
 
 
 sessions: dict[str, SessionContext] = {}
-orchestrator = InsuranceOrchestrator()
-transcriber = CartesiaTranscriber()
-tts = CartesiaTTS()
+orchestrator: InsuranceOrchestrator | None = None
+transcriber: CartesiaTranscriber | None = None
+tts: CartesiaTTS | None = None
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    global orchestrator, transcriber, tts
+    load_runtime_env()
     await init_db()
+    orchestrator = InsuranceOrchestrator()
+    transcriber = CartesiaTranscriber()
+    tts = CartesiaTTS()
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, str | float]:
+    return {
+        "status": "ok",
+        "version": read_version(),
+        "database": await database_status(),
+        "uptime": round((datetime.now(timezone.utc) - APP_STARTED_AT).total_seconds(), 3),
+    }
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await close_db()
 
 
 @app.post("/twilio/voice")
@@ -309,7 +329,7 @@ async def handle_audio_chunk(websocket: WebSocket, session: SessionContext, chun
         session.audio_buffer.clear()
         session.heard_speech_in_turn = False
         session.turn_detector.reset()
-        asr_result = await transcriber.transcribe(audio)
+        asr_result = await get_transcriber().transcribe(audio)
         await log_event(session.session_id, "asr_result", asr_result)
         if asr_result["confidence"] < 0.6:
             session.asr_failures += 1
@@ -360,7 +380,7 @@ async def process_transcript(session: SessionContext, transcript: str) -> GraphS
         "handoff_reason": None,
         "llm_error": None,
     }
-    result = await orchestrator.run_turn(state)
+    result = await get_orchestrator().run_turn(state)
     session.verified = result.get("verified", session.verified)
     session.policy_number = result.get("policy_number", session.policy_number)
     session.ssn_last4 = result.get("ssn_last4", session.ssn_last4)
@@ -377,7 +397,7 @@ async def send_agent_response(websocket: WebSocket, session: SessionContext, tex
     if transport == "twilio":
         await send_twilio_response(websocket, session, text)
         return
-    audio_chunks = await tts.synthesize(session.session_id, text)
+    audio_chunks = await get_tts().synthesize(session.session_id, text)
     for chunk in audio_chunks:
         await websocket.send_json(
             {
@@ -417,7 +437,7 @@ async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reaso
 
 
 async def send_twilio_response(websocket: WebSocket, session: SessionContext, text: str) -> None:
-    audio_chunks = await tts.synthesize(session.session_id, text)
+    audio_chunks = await get_tts().synthesize(session.session_id, text)
     for chunk in audio_chunks:
         pcm_chunk = base64.b64decode(chunk)
         mulaw_chunk = audioop.lin2ulaw(pcm_chunk, 2)
@@ -454,6 +474,31 @@ def build_twilio_stream_url(request: Request) -> str:
     host = request.headers.get("host", "127.0.0.1:8000")
     scheme = "wss" if request.url.scheme == "https" else "ws"
     return f"{scheme}://{host}/ws/twilio-media"
+
+
+def read_version() -> str:
+    try:
+        return VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
+    except FileNotFoundError:
+        return "unknown"
+
+
+def get_orchestrator() -> InsuranceOrchestrator:
+    if orchestrator is None:
+        raise RuntimeError("Application startup has not initialized the orchestrator.")
+    return orchestrator
+
+
+def get_transcriber() -> CartesiaTranscriber:
+    if transcriber is None:
+        raise RuntimeError("Application startup has not initialized the transcriber.")
+    return transcriber
+
+
+def get_tts() -> CartesiaTTS:
+    if tts is None:
+        raise RuntimeError("Application startup has not initialized TTS.")
+    return tts
 
 
 if __name__ == "__main__":

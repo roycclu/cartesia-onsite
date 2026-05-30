@@ -1,0 +1,14 @@
+asyncpg
+boto3
+fastapi
+langgraph
+numpy
+onnxruntime
+openai
+python-dotenv
+python-multipart
+silero-vad
+torchaudio==2.5.1+cpu
+torch==2.5.1+cpu
+uvicorn[standard]
+websockets
