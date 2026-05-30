@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from typing import Any, Literal, TypedDict
@@ -9,17 +10,18 @@ from langgraph.graph import END, StateGraph
 from openai import AsyncOpenAI
 
 from compliance import log_event
-from tools import get_claim_status, get_policy_info, trigger_handoff, verify_identity
+from tools import get_claim_status, get_policy_info, normalize_policy_number, trigger_handoff, verify_identity
 
+logger = logging.getLogger("voice_agent")
 
-POLICY_PATTERN = re.compile(r"\bPOL-\d{4}\b", re.IGNORECASE)
 SSN_PATTERN = re.compile(r"\b(\d{4})\b")
+POLICY_PATTERN = re.compile(r"\bPOL[-\s]?(\d{4})\b", re.IGNORECASE)
 SSN_CONTEXT_PATTERN = re.compile(
-    r"(?:ssn|social security number|last four(?: digits)?)(?:\D+)(\d{4})",
+    r"(?:ssn|social security number|last four(?: digits)?)\D*(\d{4})",
     re.IGNORECASE,
 )
+
 ALLOWED_INTENTS = {
-    "verify_identity",
     "get_claim_status",
     "get_policy_info",
     "handoff",
@@ -30,7 +32,6 @@ ALLOWED_INTENTS = {
 
 
 Intent = Literal[
-    "verify_identity",
     "get_claim_status",
     "get_policy_info",
     "handoff",
@@ -53,6 +54,7 @@ class GraphState(TypedDict, total=False):
     should_handoff: bool
     handoff_reason: str | None
     llm_error: str | None
+    verification_attempts: int
 
 
 class LLMHelper:
@@ -73,13 +75,11 @@ class LLMHelper:
             return "get_claim_status"
         if "policy" in lowered or "coverage" in lowered or "deductible" in lowered:
             return "get_policy_info"
-        if POLICY_PATTERN.search(transcript) or ("ssn" in lowered and SSN_PATTERN.search(transcript)):
-            return "verify_identity"
         if self.client is None:
             return "unknown"
         prompt = (
             "Classify the insurance call center request into one of: "
-            "verify_identity, get_claim_status, get_policy_info, handoff, out_of_scope, write_request, unknown. "
+            "get_claim_status, get_policy_info, handoff, out_of_scope, write_request, unknown. "
             f"Transcript: {transcript}"
         )
         try:
@@ -91,36 +91,38 @@ class LLMHelper:
             return "unknown"
 
     async def generate_response(self, state: GraphState) -> str:
-        if self.client is None:
-            return self._fallback_response(state)
         prompt = (
             "You are a concise insurance call center voice agent. "
+            "The caller has already been verified. "
+            "Answer briefly and directly based on the current state. "
+            "Do not ask for verification details again. "
             "Use the state below and produce a short spoken response.\n"
             f"State: {state}"
         )
+        logger.info("TURN [%s] PROMPT: %s", state["session_id"], prompt)
+        if self.client is None:
+            response = self._fallback_response(state)
+            logger.info("TURN [%s] LLM: %s", state["session_id"], response)
+            return response
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 response = await self.client.responses.create(model=self.model, input=prompt)
-            return (response.output_text or "").strip() or self._fallback_response(state)
+            text = (response.output_text or "").strip() or self._fallback_response(state)
+            logger.info("TURN [%s] LLM: %s", state["session_id"], text)
+            return text
         except Exception as exc:
             state["llm_error"] = str(exc)
-            return self._fallback_response(state)
+            text = self._fallback_response(state)
+            logger.info("TURN [%s] LLM: %s", state["session_id"], text)
+            return text
 
     def _fallback_response(self, state: GraphState) -> str:
         if state.get("should_handoff"):
             return "I’m transferring you to a human representative for further help."
         result = state.get("tool_result") or {}
-        if state["intent"] == "verify_identity":
-            return (
-                "Thanks, your identity is verified. How can I help with your claim or policy today?"
-                if result.get("verified")
-                else "I couldn't verify your identity. Please repeat your policy number and the last four digits of your Social Security number."
-            )
         if state["intent"] == "get_claim_status":
             if "error" in result:
                 return result["error"]
-            if "claim_id" not in result:
-                return "Thanks, your identity is verified. How can I help with your claim or policy today?"
             return (
                 f"Your claim {result['claim_id']} is {result['status']}. "
                 f"It was last updated on {result['last_updated']} by adjuster {result['adjuster_name']}."
@@ -128,8 +130,6 @@ class LLMHelper:
         if state["intent"] == "get_policy_info":
             if "error" in result:
                 return result["error"]
-            if "coverage_type" not in result:
-                return "Thanks, your identity is verified. How can I help with your claim or policy today?"
             return (
                 f"Your policy is {result['coverage_type']} with a coverage limit of {result['coverage_limit']} dollars "
                 f"and a deductible of {result['deductible']} dollars."
@@ -138,17 +138,28 @@ class LLMHelper:
             return "I can’t make account changes in this demo, so I’m connecting you with a human representative."
         if state["intent"] == "out_of_scope":
             return "That request is outside this insurance support demo, so I’m transferring you to a human representative."
-        return "Please share your policy number and the last four digits of your Social Security number so I can verify your identity."
+        return "Identity verified. How can I help you today? I can check your claim status or answer policy questions."
 
 
 class InsuranceOrchestrator:
     def __init__(self) -> None:
         self.llm = LLMHelper()
         graph = StateGraph(GraphState)
+        graph.add_node("field_extraction", self._extract_fields_node)
+        graph.add_node("verification", self._verification_node)
         graph.add_node("intent_classification", self._classify_intent)
         graph.add_node("tool_execution", self._execute_tools)
         graph.add_node("response_generation", self._generate_response)
-        graph.set_entry_point("intent_classification")
+        graph.set_entry_point("field_extraction")
+        graph.add_edge("field_extraction", "verification")
+        graph.add_conditional_edges(
+            "verification",
+            self._route_after_verification,
+            {
+                "end": END,
+                "intent_classification": "intent_classification",
+            },
+        )
         graph.add_edge("intent_classification", "tool_execution")
         graph.add_edge("tool_execution", "response_generation")
         graph.add_edge("response_generation", END)
@@ -159,12 +170,72 @@ class InsuranceOrchestrator:
         await log_event(result["session_id"], "graph_result", result)
         return result
 
-    async def _classify_intent(self, state: GraphState) -> GraphState:
+    async def _extract_fields_node(self, state: GraphState) -> GraphState:
+        extracted = extract_fields(state["transcript"])
+        if extracted["policy_number"]:
+            state["policy_number"] = extracted["policy_number"]
+        if extracted["ssn_last4"]:
+            state["ssn_last4"] = extracted["ssn_last4"]
+        await log_event(
+            state["session_id"],
+            "field_extraction",
+            {
+                "transcript": state["transcript"],
+                "policy_number": state.get("policy_number"),
+                "ssn_last4": state.get("ssn_last4"),
+            },
+        )
+        return state
+
+    async def _verification_node(self, state: GraphState) -> GraphState:
+        if state.get("verified"):
+            return state
+
         transcript = state["transcript"]
-        state["intent"] = await self.llm.classify_intent(transcript)
-        state["policy_number"] = state.get("policy_number") or _extract_policy_number(transcript)
-        state["ssn_last4"] = state.get("ssn_last4") or _extract_ssn_last4(transcript)
-        await log_event(state["session_id"], "intent_classification", {"transcript": transcript, "intent": state["intent"]})
+        policy_number = state.get("policy_number")
+        ssn_last4 = state.get("ssn_last4")
+
+        if not policy_number or not ssn_last4:
+            state["tool_result"] = {
+                "verified": False,
+                "message": "To verify your identity I need your policy number and the last 4 digits of your Social Security number. Please provide both.",
+            }
+            state["response_text"] = "To verify your identity I need your policy number and the last 4 digits of your Social Security number. Please provide both."
+            return state
+
+        verification = await verify_identity(state["session_id"], policy_number, ssn_last4)
+        state["tool_result"] = verification
+        state["policy_number"] = verification.get("policy_number", policy_number)
+
+        if verification["verified"]:
+            state["verified"] = True
+            state["verification_attempts"] = 0
+            state["response_text"] = "Identity verified. How can I help you today?"
+            return state
+
+        state["verification_attempts"] = state.get("verification_attempts", 0) + 1
+        if state["verification_attempts"] >= 3:
+            state["should_handoff"] = True
+            state["handoff_reason"] = "verification_failed"
+            state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", transcript)
+            state["response_text"] = "I’m transferring you to a human representative."
+            return state
+
+        state["response_text"] = "I need your policy number and last 4 digits of your SSN."
+        return state
+
+    def _route_after_verification(self, state: GraphState) -> str:
+        if not state.get("verified") or state.get("response_text") or state.get("should_handoff"):
+            return "end"
+        return "intent_classification"
+
+    async def _classify_intent(self, state: GraphState) -> GraphState:
+        state["intent"] = await self.llm.classify_intent(state["transcript"])
+        await log_event(
+            state["session_id"],
+            "intent_classification",
+            {"transcript": state["transcript"], "intent": state["intent"]},
+        )
         return state
 
     async def _execute_tools(self, state: GraphState) -> GraphState:
@@ -184,32 +255,12 @@ class InsuranceOrchestrator:
             state["tool_result"] = await trigger_handoff(state["session_id"], intent, transcript)
             return state
 
-        if not state.get("verified"):
-            if policy_number and state.get("ssn_last4"):
-                verification = await verify_identity(state["session_id"], policy_number, state["ssn_last4"] or "")
-                state["tool_result"] = verification
-                state["verified"] = verification["verified"]
-                if not verification["verified"]:
-                    return state
-                if intent == "verify_identity" or _is_verification_only(transcript):
-                    state["intent"] = "verify_identity"
-                    return state
-            else:
-                state["tool_result"] = {
-                    "verified": False,
-                    "message": "Identity verification required before claim or policy access.",
-                }
-                state["intent"] = "verify_identity"
-                return state
-
         if intent == "get_claim_status":
             state["tool_result"] = await get_claim_status(state["session_id"], policy_number or "")
         elif intent == "get_policy_info":
             state["tool_result"] = await get_policy_info(state["session_id"], policy_number or "")
-        elif intent == "verify_identity":
-            state["tool_result"] = {"verified": True, "policy_number": policy_number}
         else:
-            state["tool_result"] = {"message": "No tool executed."}
+            state["tool_result"] = {"message": "Identity verified. How can I help you today?"}
         return state
 
     async def _generate_response(self, state: GraphState) -> GraphState:
@@ -220,31 +271,26 @@ class InsuranceOrchestrator:
             state["handoff_reason"] = "llm_error"
             state["tool_result"] = await trigger_handoff(state["session_id"], "llm_error", state["transcript"])
             state["response_text"] = "I’m having trouble completing that request. I’ll connect you with a human representative."
-        await log_event(state["session_id"], "llm_response", {"text": state["response_text"], "handoff": state.get("should_handoff", False)})
+        await log_event(
+            state["session_id"],
+            "llm_response",
+            {"text": state["response_text"], "handoff": state.get("should_handoff", False)},
+        )
         return state
 
 
-def _extract_policy_number(text: str) -> str | None:
-    match = POLICY_PATTERN.search(text)
-    return match.group(0).upper() if match else None
+def extract_fields(transcript: str) -> dict[str, str | None]:
+    policy_match = POLICY_PATTERN.search(transcript)
+    policy_number = normalize_policy_number(policy_match.group(0)) if policy_match else None
 
+    ssn_match = SSN_CONTEXT_PATTERN.search(transcript)
+    if ssn_match:
+        ssn_last4 = ssn_match.group(1)
+    else:
+        fallback_matches = SSN_PATTERN.findall(transcript)
+        ssn_last4 = fallback_matches[-1] if fallback_matches else None
 
-def _extract_ssn_last4(text: str) -> str | None:
-    match = SSN_CONTEXT_PATTERN.search(text)
-    if match:
-        return match.group(1)
-    if "ssn" not in text.lower() and "last four" not in text.lower():
-        return None
-    matches = SSN_PATTERN.findall(text)
-    if not matches:
-        return None
-    match_value = matches[-1]
-    if match_value.upper().startswith("POL"):
-        return None
-    return match_value
-
-
-def _is_verification_only(text: str) -> bool:
-    lowered = text.lower()
-    request_terms = ("claim", "status", "coverage", "deductible", "policy info", "policy information")
-    return not any(term in lowered for term in request_terms)
+    return {
+        "policy_number": policy_number,
+        "ssn_last4": ssn_last4,
+    }

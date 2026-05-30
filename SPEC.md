@@ -235,7 +235,7 @@ Retention policy assumption for all regulated customer interaction data is seven
 ### Tool Contract: `verify_identity(policy_number, ssn_last4)`
 
 - Input:
-  - `policy_number: string`, expected pattern `POL-\d{4}` in prototype
+  - `policy_number: string`, expected pattern `POL\d{4}` in prototype
   - `ssn_last4: string`, exactly 4 digits
 - Output:
   - `verified: boolean`

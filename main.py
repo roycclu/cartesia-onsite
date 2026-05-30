@@ -25,7 +25,10 @@ from orchestration import GraphState, InsuranceOrchestrator
 from tools import trigger_handoff
 
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("websockets.client").setLevel(logging.WARNING)
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 STT_URL = "wss://api.cartesia.ai/stt/turns/websocket"
 TTS_URL = "wss://api.cartesia.ai/tts/websocket"
@@ -57,6 +60,7 @@ class SessionContext:
     ssn_last4: str | None = None
     history: list[dict[str, str]] = field(default_factory=list)
     human_requests: int = 0
+    verification_attempts: int = 0
     ink_stream: InkTurnStream | None = None
     twilio_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -122,6 +126,7 @@ class CartesiaTranscriber:
                     message.get("transcript"),
                 )
                 if event_type == "connected":
+                    logger.info("cartesia_turn_stream_open session_id=%s stream_sid=%s", session.session_id, session.stream_id)
                     await log_event(session.session_id, "cartesia_stt_connected", message)
                     continue
                 if event_type == "turn.start":
@@ -132,6 +137,7 @@ class CartesiaTranscriber:
                     continue
                 if event_type == "turn.end":
                     transcript = (message.get("transcript") or "").strip()
+                    logger.info("TURN [%s] USER: %s", session.session_id, transcript)
                     await log_event(session.session_id, "asr_result", {"text": transcript, "provider": "cartesia_ink_2"})
                     if transcript:
                         result = await process_transcript(session, transcript)
@@ -146,6 +152,8 @@ class CartesiaTranscriber:
                 session.stream_id,
             )
             await fail_safe_handoff(twilio_ws, session, f"cartesia_turns_exception:{exc}", transport="twilio")
+        finally:
+            logger.info("cartesia_turn_stream_close session_id=%s stream_sid=%s", session.session_id, session.stream_id)
 
 
 class CartesiaTTS:
@@ -336,12 +344,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 session.stream_id = event.get("streamSid")
                 session.call_sid = start.get("callSid")
                 session.ink_stream = await get_transcriber().open_twilio_turn_stream(session, websocket)
-                logger.info(
-                    "twilio_media_start session_id=%s call_sid=%s stream_sid=%s",
-                    session.session_id,
-                    session.call_sid,
-                    session.stream_id,
-                )
+                logger.info("twilio_media_start session_id=%s call_sid=%s stream_sid=%s", session.session_id, session.call_sid, session.stream_id)
                 await log_event(session.session_id, "twilio_stream_start", event)
                 await send_twilio_response(websocket, session, "Thanks for calling. Please share your policy number and the last four digits of your Social Security number.")
                 continue
@@ -349,12 +352,6 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
             if event_type == "media" and session is not None:
                 payload = event["media"]["payload"]
                 mulaw_chunk = base64.b64decode(payload)
-                logger.info(
-                    "twilio_media_chunk session_id=%s stream_sid=%s mulaw_bytes=%s",
-                    session.session_id,
-                    session.stream_id,
-                    len(mulaw_chunk),
-                )
                 await get_transcriber().send_twilio_audio(session.ink_stream, mulaw_chunk)
                 continue
 
@@ -427,6 +424,7 @@ async def process_transcript(session: SessionContext, transcript: str) -> GraphS
         "verified": session.verified,
         "policy_number": session.policy_number,
         "ssn_last4": session.ssn_last4,
+        "verification_attempts": session.verification_attempts,
         "should_handoff": False,
         "handoff_reason": None,
         "llm_error": None,
@@ -435,6 +433,7 @@ async def process_transcript(session: SessionContext, transcript: str) -> GraphS
     session.verified = result.get("verified", session.verified)
     session.policy_number = result.get("policy_number", session.policy_number)
     session.ssn_last4 = result.get("ssn_last4", session.ssn_last4)
+    session.verification_attempts = result.get("verification_attempts", session.verification_attempts)
     session.history.extend(
         [
             {"role": "user", "content": transcript},
@@ -497,6 +496,7 @@ async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reaso
 
 async def send_twilio_response(websocket: WebSocket, session: SessionContext, text: str) -> None:
     async with session.twilio_send_lock:
+        logger.info("TURN [%s] TTS: %s", session.session_id, text)
         audio_chunks = await get_tts().synthesize(session.session_id, text)
         for chunk in audio_chunks:
             pcm_chunk = base64.b64decode(chunk)

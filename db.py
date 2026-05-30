@@ -87,27 +87,27 @@ SCHEMA_STATEMENTS = [
 
 
 SEED_POLICIES = [
-    ("POL-1001", "Maya Patel", "Auto Premium", 100000, 500, "2025-01-01"),
-    ("POL-1002", "Jordan Kim", "Home Plus", 450000, 1500, "2024-11-15"),
-    ("POL-1003", "Avery Johnson", "Renters Basic", 50000, 1000, "2025-02-10"),
-    ("POL-1004", "Sofia Ramirez", "Auto Standard", 75000, 750, "2024-09-20"),
-    ("POL-1005", "Ethan Brooks", "Life Shield", 250000, 0, "2025-03-05"),
+    ("POL1001", "Maya Patel", "Auto Premium", 100000, 500, "2025-01-01"),
+    ("POL1002", "Jordan Kim", "Home Plus", 450000, 1500, "2024-11-15"),
+    ("POL1003", "Avery Johnson", "Renters Basic", 50000, 1000, "2025-02-10"),
+    ("POL1004", "Sofia Ramirez", "Auto Standard", 75000, 750, "2024-09-20"),
+    ("POL1005", "Ethan Brooks", "Life Shield", 250000, 0, "2025-03-05"),
 ]
 
 SEED_CLAIMS = [
-    ("CLM-9001", "POL-1001", "Under review", "2026-05-28T14:15:00Z", "Dana Moore"),
-    ("CLM-9002", "POL-1002", "Approved", "2026-05-27T18:45:00Z", "Chris Nguyen"),
-    ("CLM-9003", "POL-1003", "Pending documents", "2026-05-24T09:30:00Z", "Taylor Reed"),
-    ("CLM-9004", "POL-1004", "Closed", "2026-05-18T11:10:00Z", "Morgan Ellis"),
-    ("CLM-9005", "POL-1005", "Payment issued", "2026-05-29T16:05:00Z", "Jamie Clark"),
+    ("CLM-9001", "POL1001", "Under review", "2026-05-28T14:15:00Z", "Dana Moore"),
+    ("CLM-9002", "POL1002", "Approved", "2026-05-27T18:45:00Z", "Chris Nguyen"),
+    ("CLM-9003", "POL1003", "Pending documents", "2026-05-24T09:30:00Z", "Taylor Reed"),
+    ("CLM-9004", "POL1004", "Closed", "2026-05-18T11:10:00Z", "Morgan Ellis"),
+    ("CLM-9005", "POL1005", "Payment issued", "2026-05-29T16:05:00Z", "Jamie Clark"),
 ]
 
 SEED_VERIFICATION = [
-    ("POL-1001", "4821", "Maya Patel"),
-    ("POL-1002", "1934", "Jordan Kim"),
-    ("POL-1003", "6407", "Avery Johnson"),
-    ("POL-1004", "7752", "Sofia Ramirez"),
-    ("POL-1005", "2219", "Ethan Brooks"),
+    ("POL1001", "4821", "Maya Patel"),
+    ("POL1002", "1934", "Jordan Kim"),
+    ("POL1003", "6407", "Avery Johnson"),
+    ("POL1004", "7752", "Sofia Ramirez"),
+    ("POL1005", "2219", "Ethan Brooks"),
 ]
 
 
@@ -169,6 +169,7 @@ async def ensure_pool() -> asyncpg.Pool:
 
 
 async def _seed_reference_data(conn: asyncpg.Connection) -> None:
+    await conn.execute("TRUNCATE TABLE claims, policies, verification RESTART IDENTITY CASCADE")
     await conn.executemany(
         """
         INSERT INTO policies(policy_number, holder_name, coverage_type, coverage_limit, deductible, effective_date)

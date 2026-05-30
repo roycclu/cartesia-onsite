@@ -109,7 +109,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```bash
 curl -X POST http://127.0.0.1:8000/demo/text-turn \
   -H 'Content-Type: application/json' \
-  -d '{"transcript":"My policy number is POL-1001 and the last four of my SSN are 4821"}'
+  -d '{"transcript":"My policy number is POL1001 and the last four of my SSN are 4821"}'
 ```
 
 Then:
