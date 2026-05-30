@@ -4,3 +4,4 @@ insurance_demo.db
 .env
 .venv/
 *.pem
+VERSION

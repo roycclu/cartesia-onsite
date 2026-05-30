@@ -4,12 +4,12 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
   "memory": "2048",
-  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/voice-agent-demo-task-role",
+  "executionRoleArn": "arn:aws:iam::013200615679:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::013200615679:role/voice-agent-demo-task-role",
   "containerDefinitions": [
     {
       "name": "voice-agent-demo",
-      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/voice-agent-demo:latest",
+      "image": "013200615679.dkr.ecr.us-east-2.amazonaws.com/voice-agent-demo:latest",
       "essential": true,
       "portMappings": [
         {
