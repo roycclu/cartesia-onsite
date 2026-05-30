@@ -72,7 +72,7 @@ export CARTESIA_API_KEY=...
 export TWILIO_ACCOUNT_SID=...
 export TWILIO_AUTH_TOKEN=...
 export DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/voice_agent
-export AWS_REGION=us-east-1
+export AWS_REGION=us-east-2
 export CARTESIA_VOICE_ID=...
 export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-4o-mini
@@ -177,7 +177,7 @@ Important notes for Twilio:
 
 - `deploy/buildspec.yml` builds the image in CodeBuild, writes the current commit hash into `VERSION`, and pushes both `latest` and the commit-tagged image to ECR.
 - `deploy/taskdef.json` defines a Fargate task sized at 1 vCPU and 2 GB RAM for ECS and passes `AWS_REGION` plus `SSM_PARAMETER_PREFIX` so the app can load runtime secrets from SSM Parameter Store.
-- `deploy/deploy.sh` builds locally, tags the image with `git rev-parse HEAD`, pushes to `voice-agent-demo` in `us-east-1`, registers a new task definition revision, and updates the ECS service.
+- `deploy/deploy.sh` builds locally, tags the image with `git rev-parse HEAD`, pushes to `voice-agent-demo` in `us-east-2`, registers a new task definition revision, and updates the ECS service.
 
 ## Tradeoffs
 

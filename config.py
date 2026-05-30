@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 
 DEFAULTS = {
-    "AWS_REGION": "us-east-1",
+    "AWS_REGION": "us-east-2",
     "CARTESIA_VERSION": "2026-03-01",
     "CARTESIA_VOICE_ID": "a0e99841-438c-4a64-b679-ae501e7d6091",
     "DATABASE_URL": "postgresql://postgres:postgres@postgres:5432/voice_agent",

@@ -15,7 +15,7 @@ from tools import get_claim_status, get_policy_info, normalize_policy_number, tr
 logger = logging.getLogger("voice_agent")
 
 SSN_PATTERN = re.compile(r"\b(\d{4})\b")
-POLICY_PATTERN = re.compile(r"\bPOL[-\s]?(\d{4})\b", re.IGNORECASE)
+POLICY_PATTERN = re.compile(r"\b([A-Z]{2,4}\d?)[-\s]?(\d{3,4})\b", re.IGNORECASE)
 SSN_CONTEXT_PATTERN = re.compile(
     r"(?:ssn|social security number|last four(?: digits)?)\D*(\d{4})",
     re.IGNORECASE,
@@ -172,10 +172,19 @@ class InsuranceOrchestrator:
 
     async def _extract_fields_node(self, state: GraphState) -> GraphState:
         extracted = extract_fields(state["transcript"])
+        extracted_policy = extracted["policy_number"]
+        extracted_ssn = extracted["ssn_last4"]
         if extracted["policy_number"]:
             state["policy_number"] = extracted["policy_number"]
         if extracted["ssn_last4"]:
             state["ssn_last4"] = extracted["ssn_last4"]
+        logger.info(
+            "EXTRACT [%s] raw_transcript=%r extracted_policy=%r extracted_ssn=%r",
+            state["session_id"],
+            state["transcript"],
+            extracted_policy,
+            extracted_ssn,
+        )
         await log_event(
             state["session_id"],
             "field_extraction",
@@ -194,6 +203,14 @@ class InsuranceOrchestrator:
         transcript = state["transcript"]
         policy_number = state.get("policy_number")
         ssn_last4 = state.get("ssn_last4")
+        both_present = bool(policy_number and ssn_last4)
+        logger.info(
+            "VERIFY_CHECK [%s] state_policy=%r state_ssn=%r both_present=%s",
+            state["session_id"],
+            policy_number,
+            ssn_last4,
+            both_present,
+        )
 
         if not policy_number or not ssn_last4:
             state["tool_result"] = {
@@ -203,9 +220,22 @@ class InsuranceOrchestrator:
             state["response_text"] = "To verify your identity I need your policy number and the last 4 digits of your Social Security number. Please provide both."
             return state
 
+        logger.info(
+            "VERIFY_CALL [%s] calling verify_identity with policy=%r ssn=%r",
+            state["session_id"],
+            policy_number,
+            ssn_last4,
+        )
         verification = await verify_identity(state["session_id"], policy_number, ssn_last4)
         state["tool_result"] = verification
         state["policy_number"] = verification.get("policy_number", policy_number)
+        logger.info(
+            "VERIFY_RESULT [%s] verified=%s holder=%r message=%r",
+            state["session_id"],
+            verification.get("verified"),
+            verification.get("holder_name"),
+            verification.get("message"),
+        )
 
         if verification["verified"]:
             state["verified"] = True
@@ -264,6 +294,12 @@ class InsuranceOrchestrator:
         return state
 
     async def _generate_response(self, state: GraphState) -> GraphState:
+        logger.info(
+            "LLM_INPUT [%s] verified=%s proceeding_to_intent=%s",
+            state["session_id"],
+            state.get("verified", False),
+            state.get("verified", False),
+        )
         response = await self.llm.generate_response(state)
         state["response_text"] = response
         if state.get("llm_error"):
@@ -281,7 +317,9 @@ class InsuranceOrchestrator:
 
 def extract_fields(transcript: str) -> dict[str, str | None]:
     policy_match = POLICY_PATTERN.search(transcript)
-    policy_number = normalize_policy_number(policy_match.group(0)) if policy_match else None
+    policy_number = None
+    if policy_match:
+        policy_number = normalize_policy_number(f"{policy_match.group(1)}{policy_match.group(2)}")
 
     ssn_match = SSN_CONTEXT_PATTERN.search(transcript)
     if ssn_match:

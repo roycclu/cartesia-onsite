@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "voice-agent-demo",
-      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/voice-agent-demo:latest",
+      "image": "<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/voice-agent-demo:latest",
       "essential": true,
       "portMappings": [
         {
@@ -19,14 +19,14 @@
         }
       ],
       "environment": [
-        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "AWS_REGION", "value": "us-east-2" },
         { "name": "SSM_PARAMETER_PREFIX", "value": "/voice-agent-demo/" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/voice-agent-demo",
-          "awslogs-region": "us-east-1",
+          "awslogs-region": "us-east-2",
           "awslogs-stream-prefix": "ecs"
         }
       },

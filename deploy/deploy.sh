@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AWS_REGION="${AWS_REGION:-us-east-1}"
+AWS_REGION="${AWS_REGION:-us-east-2}"
 ECR_REPO="${ECR_REPO:-voice-agent-demo}"
 ECS_CLUSTER="${ECS_CLUSTER:-voice-agent-demo}"
 ECS_SERVICE="${ECS_SERVICE:-voice-agent-demo}"

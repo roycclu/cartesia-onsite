@@ -6,7 +6,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://postgres:postgres@host.docker.internal:5433/voice_agent
-      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_REGION: ${AWS_REGION:-us-east-2}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
