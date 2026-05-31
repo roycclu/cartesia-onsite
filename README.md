@@ -1,213 +1,82 @@
-# Insurance Voice Agent Demo
+# Acme Insurance CX Agent — Prototype
 
-This prototype is a FastAPI-based voice AI demo for an insurance call center. It accepts streaming call input, transcribes speech with Cartesia Ink-2 turn detection, routes each completed turn through a LangGraph workflow, queries a seeded PostgreSQL insurance database, and returns spoken responses. It also logs compliance events and defaults to human handoff on failures.
+**What this is:** A working voice agent prototype for an insurance call center pilot. Handles claim status, policy questions, and human handoff over a real phone call.
 
-It now supports two ingress paths:
+**Try it:** Call **(628) 203-1893** · Identify with policy `POL1001` and SSN last 4 `4821`
 
-- Direct demo/testing via HTTP and WebSocket endpoints in this app
-- Twilio Programmable Voice via TwiML webhook plus Twilio Media Streams
+## Approach
 
-## What is mocked vs. production
+This prototype uses Twilio for telephony, Cartesia Ink-2 for streaming STT with built-in VAD and turn detection, LangGraph for orchestration, Cartesia Sonic for streaming TTS, and PostgreSQL for append-only compliance logging. Audio and control flow stream end-to-end. Ink-2 turn detection removes the need for a local VAD layer, which keeps the telephony pipeline simpler and avoids frame-size edge cases.
 
-Mocked in this repo:
+The deployment path is Docker-first. Images are built locally or in CodeBuild, pushed to AWS ECR, and referenced by ECS Fargate task-definition scaffolding. Terraform defines the core infrastructure primitives. Secrets come from `.env` locally and SSM Parameter Store in production. Every image is tagged with the git commit hash for rollback and traceability.
 
-- The insurance data store uses PostgreSQL with seeded fake records.
-- Identity verification uses a mock `verification` table with policy number plus SSN last 4.
-- The insurance workflow itself is demo-scoped and seeded with fake data rather than production system integrations.
-
-Production-facing pieces in this prototype:
-
-- FastAPI app structure for inbound call/session handling.
-- WebSocket envelope compatible with Cartesia's current Calls API pattern.
-- Cartesia Ink-2 turn-based STT WebSocket integration path.
-- Cartesia Sonic TTS WebSocket integration path.
-- LangGraph orchestration with intent classification, tool execution, and response generation nodes.
-- Append-only compliance logging.
-
-## Architecture
-
-## Architecture Notes
-
-- `app/` contains the production voice agent service: FastAPI ingress, Cartesia/Twilio media handling, orchestration, prompts, and compliance logic.
-- `mock_data/` contains prototype-only simulations of Acme's internal systems used by this demo.
-- In production, `mock_data/` is replaced entirely by Acme's existing read-only APIs and infrastructure-owned data access paths.
-
-Core files:
-
-- [app/main.py](/home/roy/cartesia_onsite/app/main.py): FastAPI app, session lifecycle, WebSocket/audio flow, mock text-turn endpoint.
-- [app/orchestration.py](/home/roy/cartesia_onsite/app/orchestration.py): LangGraph state machine and fallback LLM helpers.
-- [app/tools.py](/home/roy/cartesia_onsite/app/tools.py): Read-only insurance tools, identity verification, and handoff logging.
-- [mock_data/db.py](/home/roy/cartesia_onsite/mock_data/db.py): Prototype PostgreSQL schema, seed data, and query helpers that simulate Acme internal systems.
-- [app/compliance.py](/home/roy/cartesia_onsite/app/compliance.py): Append-only compliance log helpers.
-
-Call flow:
-
-1. Client starts a call session with `POST /calls/start` or directly opens `ws://.../ws/cartesia/{session_id}`.
-2. Audio chunks arrive as WebSocket `media_input` events or raw bytes.
-3. Twilio telephony streams raw `mulaw` audio directly to Cartesia Ink-2, which handles VAD and turn detection internally.
-4. Completed user turns are transcribed with Cartesia Ink-2 STT.
-5. LangGraph runs `intent_classification -> tool_execution -> response_generation`.
-6. Tool calls hit the PostgreSQL mock DB only after identity verification passes.
-7. Response text is synthesized through Cartesia Sonic TTS and streamed back as `media_output`.
-8. Compliance events are appended through the full path.
-
-## Edge Cases Covered
-
-- Two human requests trigger immediate handoff.
-- Out-of-scope or write requests trigger handoff.
-- LLM errors trigger fallback messaging plus handoff.
-- Unhandled exceptions trigger default handoff.
-
-## How to Run
-
-### 1. Install dependencies
-
-The environment used for this prototype already had the core packages, but a clean environment should install:
-
-```bash
-pip install fastapi uvicorn langgraph openai websockets
-```
-
-### 2. Set environment variables
-
-For full external integrations:
-
-```bash
-export CARTESIA_API_KEY=...
-export TWILIO_ACCOUNT_SID=...
-export TWILIO_AUTH_TOKEN=...
-export OPENAI_API_KEY=...
-export DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/voice_agent
-export PUBLIC_BASE_URL=https://your-public-domain.example.com
-export AWS_REGION=us-east-2
-export CARTESIA_VOICE_ID=...
-export OPENAI_MODEL=gpt-4o-mini
-export SSM_PARAMETER_PREFIX=/voice-agent-demo/
-export LLM_TIMEOUT_SECONDS=8
-```
-
-Local startup loads `.env` automatically when `AWS_EXECUTION_ENV` is not set.
-
-On AWS, startup skips `.env` and loads configuration from SSM Parameter Store instead. The app expects parameters under `SSM_PARAMETER_PREFIX` and maps names directly, for example:
+## Structure
 
 ```text
-/voice-agent-demo/CARTESIA_API_KEY
-/voice-agent-demo/TWILIO_ACCOUNT_SID
-/voice-agent-demo/TWILIO_AUTH_TOKEN
-/voice-agent-demo/DATABASE_URL
+app/
+  call_state.py            # Per-call state dataclass with lifecycle methods
+  call_state_manager.py    # In-memory registry of active calls
+  orchestration.py         # LangGraph — intent → tool → response
+  prompts.py               # All prompts, centralized and versioned
+  tools.py                 # Read-only tools: claim status, policy lookup, handoff
+
+mock_data/                 # Prototype-only simulation of Acme's internal systems
+                           # Replaced entirely by Acme's APIs in production
+
+infrastructure/            # Terraform — ECR, ECS cluster, IAM roles
+deploy/                    # deploy.sh, ECS task definition, CodeBuild spec
 ```
 
-### 3. Start the server
+## Assumptions
 
-```bash
-docker compose up --build
-```
-
-Or:
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### 4. Try the text demo path
-
-```bash
-curl -X POST http://127.0.0.1:8000/demo/text-turn \
-  -H 'Content-Type: application/json' \
-  -d '{"transcript":"My policy number is POL1001 and the last four of my SSN are 4821"}'
-```
-
-Then:
-
-```bash
-curl -X POST http://127.0.0.1:8000/demo/text-turn \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":"<returned_session_id>","transcript":"What is my claim status?"}'
-```
-
-### 5. Try the WebSocket path
-
-The WebSocket endpoint is:
-
-```text
-ws://127.0.0.1:8000/ws/cartesia/{session_id}
-```
-
-It accepts a Cartesia-like message envelope:
-
-```json
-{"event":"start","stream_id":"demo-stream","config":{"input_format":"mulaw_8000"}}
-```
-
-and then:
-
-```json
-{"event":"media_input","stream_id":"demo-stream","media":{"payload":"<base64 audio>"}}
-```
-
-### 6. Try the Twilio phone path
-
-Set a public base URL so the webhook can generate the correct `wss://` stream target:
-
-```bash
-export PUBLIC_BASE_URL=https://your-public-domain.example.com
-```
-
-If you are testing locally, expose the app publicly first, for example with `ngrok`:
-
-```bash
-ngrok http 8000
-export PUBLIC_BASE_URL=https://your-ngrok-subdomain.ngrok-free.app
-```
-
-Configure your Twilio phone number's voice webhook to:
-
-```text
-POST https://your-public-domain.example.com/twilio/voice
-```
-
-On inbound call, Twilio will request TwiML from `/twilio/voice`, then open a bidirectional Media Stream to:
-
-```text
-wss://your-public-domain.example.com/ws/twilio-media
-```
-
-Important notes for Twilio:
-
-- Twilio Media Streams uses `audio/x-mulaw` at 8 kHz. The app forwards inbound `mulaw` directly to Cartesia Ink-2 STT and converts TTS PCM back to `mulaw` for playback.
-- Live spoken responses require valid Cartesia and OpenAI credentials; startup now fails fast if required configuration is missing.
-- For a real phone demo, set your Twilio number webhook after the app is reachable over public HTTPS/WSS.
-
-## AWS Deployment
-
-- `deploy/buildspec.yml` builds the image in CodeBuild, writes the current commit hash into `VERSION`, and pushes both `latest` and the commit-tagged image to ECR.
-- `deploy/taskdef.json` defines a Fargate task sized at 1 vCPU and 2 GB RAM for ECS and passes `AWS_REGION` plus `SSM_PARAMETER_PREFIX` so the app can load runtime secrets from SSM Parameter Store.
-- `deploy/deploy.sh` builds locally, tags the image with `git rev-parse HEAD`, pushes to `voice-agent-demo` in `us-east-2`, registers a new task definition revision, and updates the ECS service.
+- Audio format assumed 8kHz 16-bit LPCM mulaw from telephony — confirmed with Twilio, to be validated with Genesys in week 1.
+- Identity verification scoped to policy number + last 4 SSN only — no DOB or name required for pilot.
+- All tool calls are read-only — no write operations in pilot scope.
+- Genesys SIP integration mocked by Twilio for prototype — production integration is a week 1 telephony team dependency.
+- Mock DB simulates Acme's claims and policy systems — in production replaced by read-only API access to Acme's existing systems.
+- Compliance log retention assumed 7 years per standard insurance regulation.
+- Single tenant for prototype — multi-tenant isolation required for production.
 
 ## Tradeoffs
 
-- The telephony bridge is demo-focused. It mirrors Cartesia's current WebSocket call event shape rather than implementing a full production phone provider bridge.
-- Turn detection relies on Cartesia Ink-2 rather than a local VAD layer, which simplifies the telephony pipeline but couples turn timing to the STT provider.
-- The orchestration graph is intentionally narrow: three nodes only, matching the spec and keeping behavior easy to inspect.
-- The compliance logger is append-only and enforced at the PostgreSQL table level.
+**Cartesia Ink-2 built-in VAD over local Silero VAD**  
+Simplifies pipeline, eliminates frame-size errors on telephony audio.  
+*Tradeoff: turn detection timing coupled to STT provider.*
 
-## What Changes for a Real VPC Deployment
+**Explicit tool calls over RAG**  
+Deterministic and fully auditable — no hallucination risk on regulated financial data.  
+*Tradeoff: every new query type requires a new tool.*
 
-- Move the demo PostgreSQL schema into managed RDS/PostgreSQL and split compliance/handoff logs into separate audited schemas.
-- Run a dedicated media gateway for telephony provider bridging and jitter buffering.
-- Store call audio and transcripts in durable object storage.
-- Add auth around all operational endpoints.
-- Use a real secrets manager for API keys.
-- Split async workers for STT/TTS and handoff actions.
-- Add proper observability: traces, structured logs, metrics, alarms, and dead-letter handling.
-- Enforce network egress rules and private connectivity for model providers where available.
+**PostgreSQL append-only over NoSQL for compliance logs**  
+Auditor-friendly, relational, queryable post-hoc by regulators.  
+*Tradeoff: less scalable than NoSQL at 1500 concurrent — week 5 optimization.*
 
-## Cartesia Docs Used
+**Regex field extraction over LLM extraction for identity**  
+Reliable policy number and SSN parsing independent of LLM behavior.  
+*Tradeoff: brittle on unusual ASR output — normalization layer handles O/0 and format variants.*
 
-- Calls/WebSocket API: https://docs.cartesia.ai/line/integrations/websocket-api
-- STT Turns WebSocket API: https://docs.cartesia.ai/api-reference/stt/turns/websocket
-- TTS WebSocket API: https://docs.cartesia.ai/api-reference/tts/websocket
+## What Changes for Production
 
-## Word Export
+- Cartesia public API → self-hosted models inside Acme's AWS VPC
+- Twilio → real Genesys SIP integration
+- `mock_data/` → read-only API access to Acme's existing systems
+- Local PostgreSQL → RDS with immutable compliance logging
+- Single EC2 + ngrok → ECS Fargate with ALB, ACM certificate, auto-scaling
+- CloudWatch only → LangSmith for full LLM trace observability
+- Mutable ECR tags → immutable tags with git commit hash
 
-`pandoc` was not installed in this environment. Run `brew install pandoc` then `pandoc SPEC.md -o SPEC.docx` to generate a Word version if you want a pandoc-based export.
+## Running Locally
+
+```bash
+cp .env.example .env  # add your API keys
+docker compose up --build
+# app runs on http://localhost:8000
+```
+
+For Twilio phone testing:
+
+```bash
+ngrok http 8000
+# set PUBLIC_BASE_URL to ngrok URL
+# set Twilio webhook to POST /twilio/voice
+```
