@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import asyncpg
 
-
-DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@postgres:5432/voice_agent"
+from app import config
 
 pool: asyncpg.Pool | None = None
 
@@ -190,7 +188,7 @@ def dump_json(data: Any) -> str:
 async def ensure_pool() -> asyncpg.Pool:
     global pool
     if pool is None:
-        pool = await asyncpg.create_pool(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL), min_size=1, max_size=5)
+        pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=5)
     return pool
 
 

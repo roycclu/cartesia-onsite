@@ -21,8 +21,7 @@ import websockets
 from app.call_state import CallState
 from app.call_state_manager import call_state_manager
 from app.compliance import get_session_log, log_event, persist_call_record
-from app.config import load_runtime_env
-from app.db import close_db, database_status, init_db, ensure_pool
+from app import config
 from app.orchestration import GraphState, InsuranceOrchestrator
 from app.prompts import (
     FILLER_PHRASE,
@@ -32,6 +31,7 @@ from app.prompts import (
     PROMPT_VERSION,
 )
 from app.tools import trigger_handoff
+from mock_data.db import close_db, database_status, ensure_pool, init_db
 
 
 logging.basicConfig(level=logging.INFO)
@@ -61,8 +61,8 @@ class TextTurnRequest(BaseModel):
 
 class CartesiaTranscriber:
     def __init__(self) -> None:
-        self.api_key = os.getenv("CARTESIA_API_KEY")
-        self.version = os.getenv("CARTESIA_VERSION", "2026-03-01")
+        self.api_key = config.CARTESIA_API_KEY
+        self.version = config.CARTESIA_VERSION
 
     async def open_twilio_turn_stream(self, session: CallState, websocket: WebSocket) -> InkTurnStream | None:
         if not self.api_key:
@@ -169,9 +169,9 @@ class CartesiaTranscriber:
 
 class CartesiaTTS:
     def __init__(self) -> None:
-        self.api_key = os.getenv("CARTESIA_API_KEY")
-        self.version = os.getenv("CARTESIA_VERSION", "2026-03-01")
-        self.voice_id = os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091")
+        self.api_key = config.CARTESIA_API_KEY
+        self.version = config.CARTESIA_VERSION
+        self.voice_id = config.CARTESIA_VOICE_ID
 
     async def stream_synthesize(self, session_id: str, text: str):
         if not self.api_key:
@@ -218,7 +218,8 @@ tts: CartesiaTTS | None = None
 @app.on_event("startup")
 async def startup() -> None:
     global orchestrator, transcriber, tts
-    load_runtime_env()
+    config.load_runtime_env()
+    logger.info("CONFIG_OK model=%s region=%s prompt_version=%s", config.OPENAI_MODEL, config.AWS_REGION, PROMPT_VERSION)
     await init_db()
     orchestrator = InsuranceOrchestrator()
     transcriber = CartesiaTranscriber()
@@ -520,7 +521,6 @@ async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: st
         {
             "event": "transfer_call",
             "stream_id": session.stream_sid,
-            "transfer": {"target_phone_number": os.getenv("HUMAN_HANDOFF_NUMBER", "+15555550199")},
             "reason": payload["reason_code"],
             "text": HUMAN_HANDOFF_PROMPT,
         }
@@ -648,7 +648,7 @@ async def finalize_call(session: CallState, resolved: bool = False) -> None:
 
 
 def build_twilio_stream_url(request: Request) -> str:
-    public_base = os.getenv("PUBLIC_BASE_URL")
+    public_base = config.PUBLIC_BASE_URL
     if public_base:
         base = public_base.rstrip("/")
         if base.startswith("https://"):

@@ -6,31 +6,54 @@ import boto3
 from dotenv import load_dotenv
 
 
-DEFAULTS = {
-    "AWS_REGION": "us-east-2",
-    "CARTESIA_VERSION": "2026-03-01",
-    "CARTESIA_VOICE_ID": "a0e99841-438c-4a64-b679-ae501e7d6091",
-    "DATABASE_URL": "postgresql://postgres:postgres@postgres:5432/voice_agent",
-    "HUMAN_HANDOFF_NUMBER": "+15555550199",
-    "LLM_TIMEOUT_SECONDS": "8",
-    "OPENAI_MODEL": "gpt-4o-mini",
-    "SSM_PARAMETER_PREFIX": "/voice-agent-demo/",
-}
+DEFAULT_AWS_REGION = "us-east-2"
+DEFAULT_SSM_PARAMETER_PREFIX = "/voice-agent-demo/"
 
-SSM_MANAGED_KEYS = {
-    "AWS_REGION",
+REQUIRED_KEYS = (
     "CARTESIA_API_KEY",
-    "CARTESIA_VOICE_ID",
-    "CARTESIA_VERSION",
-    "DATABASE_URL",
-    "HUMAN_HANDOFF_NUMBER",
-    "LLM_TIMEOUT_SECONDS",
-    "OPENAI_API_KEY",
-    "OPENAI_MODEL",
-    "PUBLIC_BASE_URL",
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "DATABASE_URL",
+    "PUBLIC_BASE_URL",
+)
+
+OPTIONAL_DEFAULTS = {
+    "CARTESIA_VOICE_ID": "a0e99841-438c-4a64-b679-ae501e7d6091",
+    "CARTESIA_VERSION": "2026-03-01",
+    "OPENAI_MODEL": "gpt-4o-mini",
+    "AWS_REGION": DEFAULT_AWS_REGION,
+    "SSM_PARAMETER_PREFIX": DEFAULT_SSM_PARAMETER_PREFIX,
+    "LLM_TIMEOUT_SECONDS": "8",
 }
+
+SSM_MANAGED_KEYS = set(REQUIRED_KEYS) | set(OPTIONAL_DEFAULTS)
+
+CARTESIA_API_KEY: str | None = None
+TWILIO_ACCOUNT_SID: str | None = None
+TWILIO_AUTH_TOKEN: str | None = None
+OPENAI_API_KEY: str | None = None
+DATABASE_URL: str | None = None
+PUBLIC_BASE_URL: str | None = None
+CARTESIA_VOICE_ID: str = OPTIONAL_DEFAULTS["CARTESIA_VOICE_ID"]
+CARTESIA_VERSION: str = OPTIONAL_DEFAULTS["CARTESIA_VERSION"]
+OPENAI_MODEL: str = OPTIONAL_DEFAULTS["OPENAI_MODEL"]
+AWS_REGION: str = OPTIONAL_DEFAULTS["AWS_REGION"]
+SSM_PARAMETER_PREFIX: str = OPTIONAL_DEFAULTS["SSM_PARAMETER_PREFIX"]
+LLM_TIMEOUT_SECONDS: int = int(OPTIONAL_DEFAULTS["LLM_TIMEOUT_SECONDS"])
+
+
+def require(key: str) -> str:
+    value = os.getenv(key)
+    if not value:
+        raise ValueError(
+            f"Required environment variable '{key}' is not set. Check your .env file or SSM Parameter Store."
+        )
+    return value
+
+
+def optional(key: str, default: str | None = None) -> str | None:
+    return os.getenv(key, default)
 
 
 def load_runtime_env() -> None:
@@ -38,13 +61,51 @@ def load_runtime_env() -> None:
         _load_from_ssm()
     else:
         load_dotenv(override=False)
-    for key, value in DEFAULTS.items():
-        os.environ.setdefault(key, value)
+    _bind_settings()
+
+
+def _bind_settings() -> None:
+    global CARTESIA_API_KEY
+    global TWILIO_ACCOUNT_SID
+    global TWILIO_AUTH_TOKEN
+    global OPENAI_API_KEY
+    global DATABASE_URL
+    global PUBLIC_BASE_URL
+    global CARTESIA_VOICE_ID
+    global CARTESIA_VERSION
+    global OPENAI_MODEL
+    global AWS_REGION
+    global SSM_PARAMETER_PREFIX
+    global LLM_TIMEOUT_SECONDS
+
+    CARTESIA_API_KEY = require("CARTESIA_API_KEY")
+    TWILIO_ACCOUNT_SID = require("TWILIO_ACCOUNT_SID")
+    TWILIO_AUTH_TOKEN = require("TWILIO_AUTH_TOKEN")
+    OPENAI_API_KEY = require("OPENAI_API_KEY")
+    DATABASE_URL = require("DATABASE_URL")
+    PUBLIC_BASE_URL = require("PUBLIC_BASE_URL")
+
+    CARTESIA_VOICE_ID = optional("CARTESIA_VOICE_ID", OPTIONAL_DEFAULTS["CARTESIA_VOICE_ID"]) or OPTIONAL_DEFAULTS[
+        "CARTESIA_VOICE_ID"
+    ]
+    CARTESIA_VERSION = optional("CARTESIA_VERSION", OPTIONAL_DEFAULTS["CARTESIA_VERSION"]) or OPTIONAL_DEFAULTS[
+        "CARTESIA_VERSION"
+    ]
+    OPENAI_MODEL = optional("OPENAI_MODEL", OPTIONAL_DEFAULTS["OPENAI_MODEL"]) or OPTIONAL_DEFAULTS["OPENAI_MODEL"]
+    AWS_REGION = optional("AWS_REGION", OPTIONAL_DEFAULTS["AWS_REGION"]) or OPTIONAL_DEFAULTS["AWS_REGION"]
+    SSM_PARAMETER_PREFIX = _normalize_prefix(
+        optional("SSM_PARAMETER_PREFIX", OPTIONAL_DEFAULTS["SSM_PARAMETER_PREFIX"])
+        or OPTIONAL_DEFAULTS["SSM_PARAMETER_PREFIX"]
+    )
+    LLM_TIMEOUT_SECONDS = int(
+        optional("LLM_TIMEOUT_SECONDS", OPTIONAL_DEFAULTS["LLM_TIMEOUT_SECONDS"])
+        or OPTIONAL_DEFAULTS["LLM_TIMEOUT_SECONDS"]
+    )
 
 
 def _load_from_ssm() -> None:
-    region = os.getenv("AWS_REGION", DEFAULTS["AWS_REGION"])
-    prefix = _normalize_prefix(os.getenv("SSM_PARAMETER_PREFIX", DEFAULTS["SSM_PARAMETER_PREFIX"]))
+    region = os.getenv("AWS_REGION", DEFAULT_AWS_REGION)
+    prefix = _normalize_prefix(os.getenv("SSM_PARAMETER_PREFIX", DEFAULT_SSM_PARAMETER_PREFIX))
     client = boto3.client("ssm", region_name=region)
 
     loaded_any = False
@@ -75,7 +136,8 @@ def _load_explicit_parameters(client: object, loaded_any: bool) -> None:
     if not missing and loaded_any:
         return
 
-    names = [f"{_normalize_prefix(os.getenv('SSM_PARAMETER_PREFIX', DEFAULTS['SSM_PARAMETER_PREFIX']))}{key}" for key in missing]
+    prefix = _normalize_prefix(os.getenv("SSM_PARAMETER_PREFIX", DEFAULT_SSM_PARAMETER_PREFIX))
+    names = [f"{prefix}{key}" for key in missing]
     if not names:
         return
 

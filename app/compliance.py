@@ -5,7 +5,7 @@ from typing import Any
 
 from app.call_state import CallState
 from app.prompts import PROMPT_VERSION
-from app.db import dump_json, execute, fetch_all
+from mock_data.db import dump_json, execute, fetch_all
 
 
 def utc_now_iso() -> str:

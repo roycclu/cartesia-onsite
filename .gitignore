@@ -5,3 +5,7 @@ insurance_demo.db
 .venv/
 *.pem
 VERSION
+infrastructure/.terraform/
+infrastructure/.terraform.lock.hcl
+infrastructure/*.tfstate
+infrastructure/*.tfstate.*

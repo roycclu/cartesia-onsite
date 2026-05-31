@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from app.compliance import log_event, utc_now_iso
-from app.db import execute, fetch_all, fetch_one
+from mock_data.db import execute, fetch_all, fetch_one
 
 logger = logging.getLogger("voice_agent")
 

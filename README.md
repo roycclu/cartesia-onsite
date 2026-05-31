@@ -13,8 +13,7 @@ Mocked in this repo:
 
 - The insurance data store uses PostgreSQL with seeded fake records.
 - Identity verification uses a mock `verification` table with policy number plus SSN last 4.
-- If `CARTESIA_API_KEY` is missing, STT and TTS fall back to mock behavior so the demo still runs.
-- LLM behavior falls back to deterministic rules when `OPENAI_API_KEY` is missing.
+- The insurance workflow itself is demo-scoped and seeded with fake data rather than production system integrations.
 
 Production-facing pieces in this prototype:
 
@@ -27,13 +26,19 @@ Production-facing pieces in this prototype:
 
 ## Architecture
 
+## Architecture Notes
+
+- `app/` contains the production voice agent service: FastAPI ingress, Cartesia/Twilio media handling, orchestration, prompts, and compliance logic.
+- `mock_data/` contains prototype-only simulations of Acme's internal systems used by this demo.
+- In production, `mock_data/` is replaced entirely by Acme's existing read-only APIs and infrastructure-owned data access paths.
+
 Core files:
 
-- [main.py](/home/roy/cartesia_onsite/main.py): FastAPI app, session lifecycle, WebSocket/audio flow, mock text-turn endpoint.
-- [orchestration.py](/home/roy/cartesia_onsite/orchestration.py): LangGraph state machine and fallback LLM helpers.
-- [tools.py](/home/roy/cartesia_onsite/tools.py): Read-only insurance tools, identity verification, and handoff logging.
-- [db.py](/home/roy/cartesia_onsite/db.py): PostgreSQL schema, seeding, and query helpers.
-- [compliance.py](/home/roy/cartesia_onsite/compliance.py): Append-only compliance log helpers.
+- [app/main.py](/home/roy/cartesia_onsite/app/main.py): FastAPI app, session lifecycle, WebSocket/audio flow, mock text-turn endpoint.
+- [app/orchestration.py](/home/roy/cartesia_onsite/app/orchestration.py): LangGraph state machine and fallback LLM helpers.
+- [app/tools.py](/home/roy/cartesia_onsite/app/tools.py): Read-only insurance tools, identity verification, and handoff logging.
+- [mock_data/db.py](/home/roy/cartesia_onsite/mock_data/db.py): Prototype PostgreSQL schema, seed data, and query helpers that simulate Acme internal systems.
+- [app/compliance.py](/home/roy/cartesia_onsite/app/compliance.py): Append-only compliance log helpers.
 
 Call flow:
 
@@ -71,15 +76,15 @@ For full external integrations:
 export CARTESIA_API_KEY=...
 export TWILIO_ACCOUNT_SID=...
 export TWILIO_AUTH_TOKEN=...
+export OPENAI_API_KEY=...
 export DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/voice_agent
+export PUBLIC_BASE_URL=https://your-public-domain.example.com
 export AWS_REGION=us-east-2
 export CARTESIA_VOICE_ID=...
-export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-4o-mini
-export HUMAN_HANDOFF_NUMBER=+15555550199
+export SSM_PARAMETER_PREFIX=/voice-agent-demo/
+export LLM_TIMEOUT_SECONDS=8
 ```
-
-If you skip the API keys, the app still runs in mock mode.
 
 Local startup loads `.env` automatically when `AWS_EXECUTION_ENV` is not set.
 
@@ -170,7 +175,7 @@ wss://your-public-domain.example.com/ws/twilio-media
 Important notes for Twilio:
 
 - Twilio Media Streams uses `audio/x-mulaw` at 8 kHz. The app forwards inbound `mulaw` directly to Cartesia Ink-2 STT and converts TTS PCM back to `mulaw` for playback.
-- Live spoken responses require `CARTESIA_API_KEY` because the mock TTS path only emits silence for telephony testing.
+- Live spoken responses require valid Cartesia and OpenAI credentials; startup now fails fast if required configuration is missing.
 - For a real phone demo, set your Twilio number webhook after the app is reachable over public HTTPS/WSS.
 
 ## AWS Deployment

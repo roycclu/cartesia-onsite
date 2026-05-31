@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
 from openai import AsyncOpenAI
 
+from app import config
 from app.call_state import CallState
 from app.compliance import log_event
 from app.prompts import (
@@ -73,9 +73,9 @@ class GraphState(TypedDict, total=False):
 
 class LLMHelper:
     def __init__(self) -> None:
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.timeout_seconds = float(os.getenv("LLM_TIMEOUT_SECONDS", "8"))
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+        self.model = config.OPENAI_MODEL
+        self.timeout_seconds = float(config.LLM_TIMEOUT_SECONDS)
+        self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
     async def classify_intent(self, transcript: str) -> Intent:
         lowered = transcript.lower()
@@ -91,8 +91,6 @@ class LLMHelper:
             return "get_claim_status"
         if "policy" in lowered or "coverage" in lowered or "deductible" in lowered:
             return "get_policy_info"
-        if self.client is None:
-            return "unknown"
         prompt = INTENT_CLASSIFICATION_PROMPT.format(transcript=transcript)
         try:
             async with asyncio.timeout(self.timeout_seconds):
@@ -110,10 +108,6 @@ class LLMHelper:
             state=call_state.to_llm_state(),
         )
         logger.info("TURN [%s] PROMPT: %s", state["session_id"], prompt)
-        if self.client is None:
-            response = self._fallback_response(state)
-            logger.info("TURN [%s] LLM: %s", state["session_id"], response)
-            return response
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 response = await self.client.responses.create(model=self.model, input=prompt)

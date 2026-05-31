@@ -11,6 +11,8 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
+    volumes:
+      - ./mock_data:/app/mock_data:ro
     depends_on:
       postgres:
         condition: service_healthy
