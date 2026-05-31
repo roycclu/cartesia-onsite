@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 import uuid
 
+from app.response_buffer import ResponseBuffer
+
 
 @dataclass
 class CallState:
@@ -26,6 +28,7 @@ class CallState:
     pending_intent: Optional[str] = None
     answered_queries: dict[str, dict[str, Any]] = field(default_factory=dict)
     turn_count: int = 0
+    human_requests: int = 0
 
     should_handoff: bool = False
     handoff_reason: Optional[str] = None
@@ -37,10 +40,19 @@ class CallState:
 
     twilio_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     tts_playing: bool = False
+    last_mark: str | None = None
     active_response_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     active_tts_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     pending_transcript: str | None = None
     ink_stream: Any = field(default=None, repr=False)
+    speculative_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    speculative_transcript: str | None = None
+    prefetched_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+    prefetch_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict, repr=False)
+    response_buffer: ResponseBuffer = field(default_factory=ResponseBuffer, repr=False)
+    interrupted: bool = False
+    twilio_websocket: Any = field(default=None, repr=False)
+    current_latency_t0: float | None = None
 
     def merge_extracted_fields(self, extracted: dict[str, Any]) -> None:
         if extracted.get("policy_number") and not self.policy_number:

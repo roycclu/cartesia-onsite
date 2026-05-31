@@ -22,15 +22,14 @@ from app.call_state import CallState
 from app.call_state_manager import call_state_manager
 from app.compliance import get_session_log, log_event, persist_call_record
 from app import config
-from app.orchestration import GraphState, InsuranceOrchestrator
+from app.orchestration import GraphState, InsuranceOrchestrator, predict_intent_fast
 from app.prompts import (
-    FILLER_PHRASE,
     GREETING_PROMPT,
     HUMAN_HANDOFF_PROMPT,
     HUMAN_REQUESTED_TWICE_PROMPT,
     PROMPT_VERSION,
 )
-from app.tools import trigger_handoff
+from app.tools import get_claim_status, get_policy_info, trigger_handoff
 from mock_data.db import close_db, database_status, ensure_pool, init_db
 
 
@@ -43,6 +42,8 @@ STT_URL = "wss://api.cartesia.ai/stt/turns/websocket"
 TTS_URL = "wss://api.cartesia.ai/tts/websocket"
 VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
 APP_STARTED_AT = datetime.now(timezone.utc)
+TWILIO_FRAME_SIZE = 160
+TWILIO_FRAME_PACE_SECONDS = 0.018
 logger = logging.getLogger("voice_agent")
 
 app = FastAPI(title="Insurance Voice Agent Demo", version="0.1.0")
@@ -128,6 +129,9 @@ class CartesiaTranscriber:
                     await log_event(session.session_id, "turn_start", message)
                     continue
                 if event_type in {"turn.update", "turn.resume"}:
+                    transcript = (message.get("transcript") or "").strip()
+                    if transcript:
+                        await maybe_prefetch_from_partial(session, transcript)
                     await log_event(session.session_id, event_type.replace(".", "_"), message)
                     continue
                 if event_type == "turn.eager_end":
@@ -136,22 +140,19 @@ class CartesiaTranscriber:
                     if transcript:
                         t0 = time.time()
                         session.pending_transcript = transcript
-                        schedule_response_task(
-                            session,
-                            handle_completed_turn(session, twilio_ws, transcript, t0, play_filler=True),
-                        )
+                        start_speculative_task(session, twilio_ws, transcript, t0)
                     continue
                 if event_type == "turn.end":
                     transcript = (message.get("transcript") or "").strip()
                     logger.info("TURN [%s] USER: %s", session.session_id, transcript)
                     await log_event(session.session_id, "asr_result", {"text": transcript, "provider": "cartesia_ink_2"})
                     if transcript:
-                        if session.pending_transcript == transcript and session.active_response_task is not None:
-                            session.pending_transcript = None
+                        if await resolve_speculative_turn(session, twilio_ws, transcript):
                             continue
+                        session.pending_transcript = transcript
                         schedule_response_task(
                             session,
-                            handle_completed_turn(session, twilio_ws, transcript, time.time(), play_filler=False),
+                            handle_completed_turn(session, twilio_ws, transcript, time.time(), speculative=False),
                         )
                     continue
                 if event_type == "error":
@@ -364,6 +365,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 sessions[session_id] = session
                 session.stream_sid = event.get("streamSid")
                 session.call_sid = start.get("callSid")
+                session.twilio_websocket = websocket
                 session.ink_stream = await get_transcriber().open_twilio_turn_stream(session, websocket)
                 logger.info("twilio_media_start session_id=%s call_sid=%s stream_sid=%s", session.session_id, session.call_sid, session.stream_sid)
                 await log_event(session.session_id, "twilio_stream_start", event)
@@ -386,6 +388,16 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
             if event_type == "dtmf" and session is not None:
                 logger.info("twilio_dtmf session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
                 await log_event(session.session_id, "twilio_dtmf", event)
+                continue
+
+            if event_type == "mark" and session is not None:
+                mark_name = event.get("mark", {}).get("name")
+                logger.info("MARK_COMPLETE [%s] mark=%s", session.session_id, mark_name)
+                if session.last_mark == mark_name:
+                    session.tts_playing = False
+                    session.last_mark = None
+                    session.response_buffer.active = False
+                await log_event(session.session_id, "twilio_mark", event)
                 continue
 
             if event_type == "stop" and session is not None:
@@ -463,6 +475,8 @@ async def process_transcript(session: CallState, transcript: str) -> GraphState:
         "handoff_reason": session.handoff_reason,
         "llm_error": None,
     }
+    if session.twilio_websocket is not None:
+        state["sentence_handler"] = build_sentence_handler(session)
     result = await get_orchestrator().run_turn(state)
     session.add_turn("user", transcript)
     session.add_turn("assistant", result["response_text"])
@@ -538,36 +552,44 @@ async def send_twilio_response(
     async with session.twilio_send_lock:
         logger.info("TURN [%s] TTS: %s", session.session_id, text)
         session.tts_playing = True
+        session.last_mark = None
         session.active_tts_task = asyncio.current_task()
         first_audio_logged = False
+        mulaw_buffer = bytearray()
         try:
             async for chunk in get_tts().stream_synthesize(session.session_id, text):
                 pcm_chunk = base64.b64decode(chunk)
-                mulaw_chunk = audioop.lin2ulaw(pcm_chunk, 2)
-                payload = base64.b64encode(mulaw_chunk).decode("utf-8")
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "event": "media",
-                            "streamSid": session.stream_sid,
-                            "media": {"payload": payload},
-                        }
-                    )
+                mulaw_buffer.extend(audioop.lin2ulaw(pcm_chunk, 2))
+                first_audio_logged = await send_audio_to_twilio(
+                    websocket,
+                    session,
+                    bytes_buffer=mulaw_buffer,
+                    first_audio_logged=first_audio_logged,
+                    latency_t0=latency_t0,
                 )
+            if mulaw_buffer:
+                padded_frame = bytes(mulaw_buffer[:TWILIO_FRAME_SIZE]).ljust(TWILIO_FRAME_SIZE, b"\xff")
+                if session.interrupted or session.response_buffer.superseded:
+                    await send_clear_to_twilio(websocket, session)
+                    return
+                await send_twilio_media_frame(websocket, session.stream_sid, padded_frame)
                 if latency_t0 is not None and not first_audio_logged:
-                    logger.info("LATENCY [%s] first_audio_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
+                    logger.info("LATENCY [%s] eager_end_to_first_audio_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
                     first_audio_logged = True
+                await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
+                mulaw_buffer.clear()
+            mark_name = f"tts_{int(time.time() * 1000)}"
+            session.last_mark = mark_name
             await websocket.send_text(
                 json.dumps(
                     {
                         "event": "mark",
                         "streamSid": session.stream_sid,
-                        "mark": {"name": f"response-{uuid.uuid4()}"},
+                        "mark": {"name": mark_name},
                     }
                 )
             )
         finally:
-            session.tts_playing = False
             if session.active_tts_task is asyncio.current_task():
                 session.active_tts_task = None
 
@@ -578,21 +600,19 @@ async def handle_completed_turn(
     transcript: str,
     latency_t0: float,
     *,
-    play_filler: bool,
+    speculative: bool,
 ) -> None:
-    filler_task: asyncio.Task[Any] | None = None
-    if play_filler:
-        logger.info("LATENCY [%s] filler_start_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
-        filler_task = asyncio.create_task(send_twilio_response(websocket, session, FILLER_PHRASE, latency_t0=latency_t0))
+    session.interrupted = False
+    session.response_buffer.start()
+    session.current_latency_t0 = latency_t0
     result = await process_transcript(session, transcript)
     logger.info("LATENCY [%s] llm_response_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
-    if filler_task is not None:
-        try:
-            await filler_task
-        except asyncio.CancelledError:
-            return
-    await send_agent_response(websocket, session, result["response_text"], transport="twilio", latency_t0=latency_t0)
+    if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0:
+        await send_agent_response(websocket, session, result["response_text"], transport="twilio", latency_t0=latency_t0)
     session.pending_transcript = None
+    if speculative:
+        session.speculative_transcript = transcript
+        session.speculative_task = asyncio.current_task()
     if session.should_close:
         await finalize_call(session, resolved=session.resolved)
         await websocket.close(code=1000)
@@ -612,11 +632,16 @@ def schedule_response_task(session: CallState, coroutine: Any) -> None:
 
 
 async def cancel_session_tasks(session: CallState) -> None:
-    tasks = [session.active_response_task, session.active_tts_task]
+    tasks = [session.active_response_task, session.active_tts_task, session.speculative_task]
     session.active_response_task = None
     session.active_tts_task = None
+    session.speculative_task = None
     session.pending_transcript = None
     session.tts_playing = False
+    session.last_mark = None
+    session.interrupted = True
+    session.response_buffer.supersede()
+    session.current_latency_t0 = None
     for task in tasks:
         if task is not None and not task.done():
             task.cancel()
@@ -631,12 +656,147 @@ async def cancel_session_tasks(session: CallState) -> None:
 
 
 async def interrupt_twilio_playback(websocket: WebSocket, session: CallState) -> None:
-    if not session.tts_playing and session.active_response_task is None:
+    if not session.tts_playing and session.active_response_task is None and session.speculative_task is None:
         return
-    logger.info("twilio_barge_in session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
+    session.tts_playing = False
+    session.last_mark = None
+    session.interrupted = True
+    session.response_buffer.supersede()
+    if session.stream_sid:
+        await send_clear_to_twilio(websocket, session)
+        logger.info("BARGE_IN [%s] cleared Twilio buffer", session.session_id)
+    await cancel_session_tasks(session)
+
+
+async def send_audio_to_twilio(
+    websocket: WebSocket,
+    session: CallState,
+    *,
+    bytes_buffer: bytearray,
+    first_audio_logged: bool,
+    latency_t0: float | None,
+) -> bool:
+    while len(bytes_buffer) >= TWILIO_FRAME_SIZE:
+        if session.interrupted or session.response_buffer.superseded:
+            await send_clear_to_twilio(websocket, session)
+            return first_audio_logged
+        frame = bytes(bytes_buffer[:TWILIO_FRAME_SIZE])
+        del bytes_buffer[:TWILIO_FRAME_SIZE]
+        await send_twilio_media_frame(websocket, session.stream_sid, frame)
+        if latency_t0 is not None and not first_audio_logged:
+            logger.info("LATENCY [%s] eager_end_to_first_audio_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
+            first_audio_logged = True
+        await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
+    return first_audio_logged
+
+
+async def send_twilio_media_frame(websocket: WebSocket, stream_sid: str | None, frame: bytes) -> None:
+    if stream_sid is None:
+        return
+    payload = base64.b64encode(frame).decode("utf-8")
+    await websocket.send_text(
+        json.dumps(
+            {
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": payload},
+            }
+        )
+    )
+
+
+async def send_clear_to_twilio(websocket: WebSocket, session: CallState) -> None:
     if session.stream_sid:
         await websocket.send_json({"event": "clear", "streamSid": session.stream_sid})
-    await cancel_session_tasks(session)
+
+
+def start_speculative_task(session: CallState, websocket: WebSocket, transcript: str, latency_t0: float) -> None:
+    if session.speculative_task is not None and not session.speculative_task.done():
+        session.speculative_task.cancel()
+    session.speculative_transcript = transcript
+    task = asyncio.create_task(handle_completed_turn(session, websocket, transcript, latency_t0, speculative=True))
+    session.speculative_task = task
+
+    def _clear_speculative(done_task: asyncio.Task[Any]) -> None:
+        if session.speculative_task is done_task:
+            session.speculative_task = None
+
+    task.add_done_callback(_clear_speculative)
+
+
+async def resolve_speculative_turn(session: CallState, websocket: WebSocket, transcript: str) -> bool:
+    speculative_transcript = session.speculative_transcript
+    speculative_task = session.speculative_task
+    if not speculative_transcript:
+        return False
+    similarity = transcript_similarity(speculative_transcript, transcript)
+    hit = similarity >= 0.80
+    logger.info("SPECULATIVE [%s] similarity=%.2f outcome=%s", session.session_id, similarity, "hit" if hit else "miss")
+    if hit:
+        session.pending_transcript = None
+        session.speculative_transcript = None
+        return True
+    session.response_buffer.supersede()
+    session.interrupted = True
+    if speculative_task is not None and not speculative_task.done():
+        speculative_task.cancel()
+        try:
+            await speculative_task
+        except asyncio.CancelledError:
+            pass
+    await send_clear_to_twilio(websocket, session)
+    session.speculative_task = None
+    session.speculative_transcript = None
+    session.pending_transcript = None
+    session.interrupted = False
+    return False
+
+
+def transcript_similarity(a: str, b: str) -> float:
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / max(len(words_a), len(words_b))
+
+
+def build_sentence_handler(session: CallState):
+    async def _handle_sentence(sentence: str) -> None:
+        if session.response_buffer.superseded or session.interrupted:
+            return
+        await send_agent_response(
+            session.twilio_websocket,
+            session,
+            sentence,
+            transport="twilio",
+            latency_t0=session.current_latency_t0,
+        )
+        session.current_latency_t0 = None
+        session.response_buffer.sentence_complete()
+
+    return _handle_sentence
+
+
+async def maybe_prefetch_from_partial(session: CallState, transcript: str) -> None:
+    if not session.verified:
+        return
+    if len(transcript.split()) < 4:
+        return
+    intent = predict_intent_fast(transcript)
+    if intent is None or intent in session.prefetched_data or intent in session.prefetch_tasks:
+        return
+
+    async def _prefetch_result() -> None:
+        try:
+            if intent == "get_claim_status":
+                result = await get_claim_status(session.session_id, session.policy_number or "")
+            else:
+                result = await get_policy_info(session.session_id, session.policy_number or "")
+            session.prefetched_data[intent] = result
+        finally:
+            session.prefetch_tasks.pop(intent, None)
+
+    session.prefetch_tasks[intent] = asyncio.create_task(_prefetch_result())
 
 
 async def finalize_call(session: CallState, resolved: bool = False) -> None:

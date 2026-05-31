@@ -3,7 +3,6 @@ from __future__ import annotations
 PROMPT_VERSION = "2026-05-31-call-state-v1"
 
 GREETING_PROMPT = "Thanks for calling. Please share your policy number and the last four digits of your Social Security number."
-FILLER_PHRASE = "Got it."
 
 VERIFICATION_REQUIRED_PROMPT = (
     "To verify your identity I need your policy number and the last 4 digits of your Social Security number. Please provide both."

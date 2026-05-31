@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Literal, TypedDict
+from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
 from openai import AsyncOpenAI
@@ -69,6 +69,7 @@ class GraphState(TypedDict, total=False):
     handoff_reason: str | None
     llm_error: str | None
     repeated_query: bool
+    sentence_handler: Callable[[str], Awaitable[None]]
 
 
 class LLMHelper:
@@ -117,6 +118,52 @@ class LLMHelper:
         except Exception as exc:
             state["llm_error"] = str(exc)
             text = self._fallback_response(state)
+            logger.info("TURN [%s] LLM: %s", state["session_id"], text)
+            return text
+
+    async def stream_response(self, state: GraphState, sentence_handler: Callable[[str], Awaitable[None]]) -> str:
+        call_state = state["call_state"]
+        repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
+        prompt = LLM_RESPONSE_PROMPT.format(
+            repeated_query_instruction=repeated_instruction,
+            state=call_state.to_llm_state(),
+        )
+        logger.info("TURN [%s] PROMPT: %s", state["session_id"], prompt)
+
+        if call_state.should_handoff or state.get("intent") == "end_conversation" or state.get("repeated_query"):
+            text = self._fallback_response(state)
+            await _emit_sentences(text, sentence_handler)
+            logger.info("TURN [%s] LLM: %s", state["session_id"], text)
+            return text
+
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                stream = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                )
+                parts: list[str] = []
+                sentence_buffer = ""
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    if not delta:
+                        continue
+                    parts.append(delta)
+                    sentence_buffer += delta
+                    sentences, sentence_buffer = _split_complete_sentences(sentence_buffer)
+                    for sentence in sentences:
+                        await sentence_handler(sentence)
+                if sentence_buffer.strip():
+                    await sentence_handler(sentence_buffer.strip())
+                    sentence_buffer = ""
+            text = "".join(parts).strip() or self._fallback_response(state)
+            logger.info("TURN [%s] LLM: %s", state["session_id"], text)
+            return text
+        except Exception as exc:
+            state["llm_error"] = str(exc)
+            text = self._fallback_response(state)
+            await _emit_sentences(text, sentence_handler)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
             return text
 
@@ -302,6 +349,15 @@ class InsuranceOrchestrator:
             state["tool_result"] = call_state.answered_queries[intent]
             return state
 
+        prefetched = call_state.prefetched_data.get(intent)
+        if prefetched is not None:
+            logger.info("PREFETCH [%s] intent=%s hit=true", state["session_id"], intent)
+            call_state.record_answered_query(intent, prefetched)
+            state["tool_result"] = prefetched
+            return state
+        if intent in {"get_claim_status", "get_policy_info"}:
+            logger.info("PREFETCH [%s] intent=%s hit=false", state["session_id"], intent)
+
         if intent == "get_claim_status":
             result = await get_claim_status(state["session_id"], call_state.policy_number or "")
             call_state.record_answered_query(intent, result)
@@ -321,7 +377,11 @@ class InsuranceOrchestrator:
             state["call_state"].verified,
             state["call_state"].verified,
         )
-        response = await self.llm.generate_response(state)
+        sentence_handler = state.get("sentence_handler")
+        if sentence_handler is not None:
+            response = await self.llm.stream_response(state, sentence_handler)
+        else:
+            response = await self.llm.generate_response(state)
         state["response_text"] = response
         if state.get("llm_error"):
             state["call_state"].should_handoff = True
@@ -363,3 +423,27 @@ def extract_fields(transcript: str) -> dict[str, str | None]:
         ssn_last4 = None
 
     return {"policy_number": policy_number, "ssn_last4": ssn_last4}
+
+
+def predict_intent_fast(partial: str) -> str | None:
+    lower = partial.lower()
+    if any(word in lower for word in ("claim", "claims", "status")):
+        return "get_claim_status"
+    if any(word in lower for word in ("policy", "coverage", "deductible")):
+        return "get_policy_info"
+    return None
+
+
+def _split_complete_sentences(buffer: str) -> tuple[list[str], str]:
+    matches = list(re.finditer(r"[^.!?]*[.!?]", buffer))
+    if not matches:
+        return [], buffer
+    sentences = [match.group(0).strip() for match in matches]
+    remainder = buffer[matches[-1].end() :]
+    return [sentence for sentence in sentences if sentence], remainder
+
+
+async def _emit_sentences(text: str, sentence_handler: Callable[[str], Awaitable[None]]) -> None:
+    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+        if sentence:
+            await sentence_handler(sentence)
