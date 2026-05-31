@@ -258,7 +258,7 @@ class InsuranceOrchestrator:
         return state
 
     def _route_after_verification(self, state: GraphState) -> str:
-        if state["response_text"] or state["call_state"].should_handoff:
+        if state.get("response_text") or state["call_state"].should_handoff:
             return "end"
         return "intent_classification"
 
