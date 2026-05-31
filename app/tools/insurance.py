@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from app.compliance import log_event, utc_now_iso
+from app.pii import mask_policy, mask_ssn
 from app.tools.extractors import NUMBER_WORDS, normalize_policy_number
 from mock_data.db import execute, fetch_all, fetch_one
 
@@ -45,8 +46,8 @@ async def verify_identity(session_id: str, policy_number: str, ssn_last4: str) -
     logger.info(
         "verification_lookup session_id=%s policy_number=%s ssn_last4=%s",
         session_id,
-        resolved_policy_number,
-        normalized_ssn_last4,
+        mask_policy(resolved_policy_number),
+        mask_ssn(normalized_ssn_last4),
     )
     record = await fetch_one(
         "SELECT policy_number, ssn_last4, holder_name FROM verification WHERE policy_number = $1",
@@ -60,7 +61,7 @@ async def verify_identity(session_id: str, policy_number: str, ssn_last4: str) -
     logger.info(
         "TURN [%s] TOOL_CALL: verify_identity | INPUT: %s | OUTPUT: %s",
         session_id,
-        {"policy_number": resolved_policy_number, "ssn_last4": normalized_ssn_last4},
+        {"policy_number": mask_policy(resolved_policy_number), "ssn_last4": mask_ssn(normalized_ssn_last4)},
         result,
     )
     await log_event(session_id, "identity_verification", result)

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.call_state import CallState
+from app.pii import hash_policy, mask_transcript
 from app.prompts import PROMPT_VERSION
 from mock_data.db import dump_json, execute, fetch_all
 
@@ -18,6 +19,8 @@ async def log_event(session_id: str, event_type: str, content: Any) -> None:
         payload.setdefault("prompt_version", PROMPT_VERSION)
     else:
         payload = {"value": content, "prompt_version": PROMPT_VERSION}
+    if event_type == "user_transcript":
+        payload["text"] = mask_transcript(payload.get("text"))
     await execute(
         "INSERT INTO compliance_log(session_id, event_type, content, timestamp) VALUES ($1, $2, $3, $4)",
         (session_id, event_type, dump_json(payload), utc_now_iso()),
@@ -70,7 +73,7 @@ async def persist_call_record(state: CallState, db_pool: Any, *, log_finalized_e
             state.call_summary["ended_at"],
             state.call_summary["duration_seconds"],
             state.call_summary["verified"],
-            state.call_summary["policy_number"],
+            hash_policy(state.policy_number),
             state.call_summary["turn_count"],
             state.call_summary["resolved"],
             state.call_summary["handoff_reason"],

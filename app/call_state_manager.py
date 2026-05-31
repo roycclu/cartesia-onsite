@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 from app.call_state import CallState
+from app.pii import mask_policy
 
 logger = logging.getLogger("voice_agent")
 
@@ -27,12 +28,13 @@ class CallStateManager:
             state.end_call(resolved=resolved)
             assert state.call_summary is not None
             logger.info(
-                "CALL_END call_id=%s duration=%.1fs turns=%s resolved=%s handoff=%s",
+                "CALL_END call_id=%s duration=%.1fs turns=%s resolved=%s handoff=%s policy=%s",
                 state.call_id,
                 state.call_summary["duration_seconds"],
                 state.turn_count,
                 resolved,
                 state.handoff_reason,
+                mask_policy(state.policy_number),
             )
         return state
 

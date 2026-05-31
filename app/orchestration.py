@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 from app import config
 from app.call_state import CallState
 from app.compliance import log_event
+from app.pii import mask_policy, mask_ssn, mask_transcript
 from app.prompts import (
     END_CONVERSATION_PROMPT,
     GREETING_PROMPT,
@@ -306,9 +307,9 @@ class InsuranceOrchestrator:
         logger.info(
             "EXTRACT [%s] raw_transcript=%r extracted_policy=%r extracted_ssn=%r",
             state["session_id"],
-            state["transcript"],
-            extracted.get("policy_number"),
-            extracted.get("ssn_last4"),
+            mask_transcript(state["transcript"]),
+            mask_policy(extracted.get("policy_number")),
+            mask_ssn(extracted.get("ssn_last4")),
         )
         await log_event(
             state["session_id"],
@@ -331,8 +332,8 @@ class InsuranceOrchestrator:
         logger.info(
             "VERIFY_CHECK [%s] state_policy=%r state_ssn=%r both_present=%s",
             state["session_id"],
-            policy_number,
-            ssn_last4,
+            mask_policy(policy_number),
+            mask_ssn(ssn_last4),
             bool(policy_number and ssn_last4),
         )
 
@@ -353,16 +354,22 @@ class InsuranceOrchestrator:
             call_state.verification_attempts += 1
             return state
 
-        logger.info("VERIFY_CALL [%s] calling verify_identity with policy=%r ssn=%r", state["session_id"], policy_number, ssn_last4)
+        logger.info(
+            "VERIFY_CALL [%s] calling verify_identity with policy=%r ssn=%r",
+            state["session_id"],
+            mask_policy(policy_number),
+            mask_ssn(ssn_last4),
+        )
         verification = await verify_identity(state["session_id"], policy_number, ssn_last4)
         state["tool_result"] = verification
         call_state.policy_number = verification.get("policy_number", call_state.policy_number)
         logger.info(
-            "VERIFY_RESULT [%s] verified=%s holder=%r message=%r",
+            "VERIFY_RESULT [%s] verified=%s holder=%r message=%r policy=%r",
             state["session_id"],
             verification.get("verified"),
             verification.get("holder_name"),
             verification.get("message"),
+            mask_policy(verification.get("policy_number")),
         )
 
         if verification["verified"]:

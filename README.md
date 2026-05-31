@@ -10,6 +10,10 @@ This prototype uses Twilio for telephony, Cartesia Ink-2 for streaming STT with 
 
 The deployment path is Docker-first. Images are built locally or in CodeBuild, pushed to AWS ECR, and referenced by ECS Fargate task-definition scaffolding. Terraform defines the core infrastructure primitives. Secrets come from `.env` locally and SSM Parameter Store in production. Every image is tagged with the git commit hash for rollback and traceability.
 
+## Architecture Notes
+
+PII masking applied at log time. SSNs masked to last 4 digits. Policy numbers masked in transcripts. Calls table stores policy hash not plaintext for audit correlation without PII exposure.
+
 ## Structure
 
 ```text

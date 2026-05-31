@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 import uuid
 
+from app.pii import mask_policy
 from app.response_buffer import ResponseBuffer
 
 logger = logging.getLogger("voice_agent")
@@ -107,7 +108,7 @@ class CallState:
             "ended_at": self.ended_at,
             "duration_seconds": (self.ended_at - self.started_at).total_seconds(),
             "verified": self.verified,
-            "policy_number": self.policy_number,
+            "policy_number": mask_policy(self.policy_number),
             "turn_count": self.turn_count,
             "resolved": self.resolved,
             "handoff_reason": self.handoff_reason,
