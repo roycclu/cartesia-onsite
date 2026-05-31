@@ -12,17 +12,25 @@ from pathlib import Path
 import time
 from urllib.parse import urlencode
 import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import FastAPI, Form, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import websockets
 
-from app.compliance import get_session_log, log_event
+from app.call_state import CallState
+from app.call_state_manager import call_state_manager
+from app.compliance import get_session_log, log_event, persist_call_record
 from app.config import load_runtime_env
-from app.db import close_db, database_status, init_db
+from app.db import close_db, database_status, init_db, ensure_pool
 from app.orchestration import GraphState, InsuranceOrchestrator
+from app.prompts import (
+    FILLER_PHRASE,
+    GREETING_PROMPT,
+    HUMAN_HANDOFF_PROMPT,
+    HUMAN_REQUESTED_TWICE_PROMPT,
+    PROMPT_VERSION,
+)
 from app.tools import trigger_handoff
 
 
@@ -36,15 +44,14 @@ TTS_URL = "wss://api.cartesia.ai/tts/websocket"
 VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
 APP_STARTED_AT = datetime.now(timezone.utc)
 logger = logging.getLogger("voice_agent")
-FILLER_PHRASE = "Got it."
 
 app = FastAPI(title="Insurance Voice Agent Demo", version="0.1.0")
 
 
-@dataclass
 class InkTurnStream:
-    websocket: Any
-    listener_task: asyncio.Task[None]
+    def __init__(self, websocket: Any, listener_task: asyncio.Task[None]) -> None:
+        self.websocket = websocket
+        self.listener_task = listener_task
 
 
 class TextTurnRequest(BaseModel):
@@ -52,31 +59,12 @@ class TextTurnRequest(BaseModel):
     transcript: str
 
 
-@dataclass
-class SessionContext:
-    session_id: str
-    stream_id: str | None = None
-    call_sid: str | None = None
-    verified: bool = False
-    policy_number: str | None = None
-    ssn_last4: str | None = None
-    history: list[dict[str, str]] = field(default_factory=list)
-    human_requests: int = 0
-    verification_attempts: int = 0
-    ink_stream: InkTurnStream | None = None
-    twilio_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    tts_playing: bool = False
-    active_response_task: asyncio.Task[Any] | None = None
-    active_tts_task: asyncio.Task[Any] | None = None
-    pending_transcript: str | None = None
-
-
 class CartesiaTranscriber:
     def __init__(self) -> None:
         self.api_key = os.getenv("CARTESIA_API_KEY")
         self.version = os.getenv("CARTESIA_VERSION", "2026-03-01")
 
-    async def open_twilio_turn_stream(self, session: SessionContext, websocket: WebSocket) -> InkTurnStream | None:
+    async def open_twilio_turn_stream(self, session: CallState, websocket: WebSocket) -> InkTurnStream | None:
         if not self.api_key:
             logger.warning("cartesia_ink_unavailable session_id=%s reason=missing_api_key", session.session_id)
             return None
@@ -99,7 +87,7 @@ class CartesiaTranscriber:
             return
         await stream.websocket.send(chunk)
 
-    async def close_turn_stream(self, session: SessionContext) -> None:
+    async def close_turn_stream(self, session: CallState) -> None:
         stream = session.ink_stream
         session.ink_stream = None
         if stream is None:
@@ -117,7 +105,7 @@ class CartesiaTranscriber:
         except Exception:
             pass
 
-    async def _consume_turn_events(self, stt_ws: Any, twilio_ws: WebSocket, session: SessionContext) -> None:
+    async def _consume_turn_events(self, stt_ws: Any, twilio_ws: WebSocket, session: CallState) -> None:
         try:
             async for raw in stt_ws:
                 if isinstance(raw, bytes):
@@ -127,12 +115,12 @@ class CartesiaTranscriber:
                 logger.info(
                     "cartesia_turn_event session_id=%s stream_sid=%s type=%s transcript=%s",
                     session.session_id,
-                    session.stream_id,
+                    session.stream_sid,
                     event_type,
                     message.get("transcript"),
                 )
                 if event_type == "connected":
-                    logger.info("cartesia_turn_stream_open session_id=%s stream_sid=%s", session.session_id, session.stream_id)
+                    logger.info("cartesia_turn_stream_open session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
                     await log_event(session.session_id, "cartesia_stt_connected", message)
                     continue
                 if event_type == "turn.start":
@@ -172,11 +160,11 @@ class CartesiaTranscriber:
             logger.exception(
                 "cartesia_turn_stream_exception session_id=%s stream_sid=%s",
                 session.session_id,
-                session.stream_id,
+                session.stream_sid,
             )
             await fail_safe_handoff(twilio_ws, session, f"cartesia_turns_exception:{exc}", transport="twilio")
         finally:
-            logger.info("cartesia_turn_stream_close session_id=%s stream_sid=%s", session.session_id, session.stream_id)
+            logger.info("cartesia_turn_stream_close session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
 
 
 class CartesiaTTS:
@@ -221,7 +209,7 @@ class CartesiaTTS:
         return [chunk async for chunk in self.stream_synthesize(session_id, text)]
 
 
-sessions: dict[str, SessionContext] = {}
+sessions: dict[str, CallState] = {}
 orchestrator: InsuranceOrchestrator | None = None
 transcriber: CartesiaTranscriber | None = None
 tts: CartesiaTTS | None = None
@@ -260,7 +248,6 @@ async def twilio_voice_webhook(
     To: str = Form(default=""),
 ) -> Response:
     session_id = str(uuid.uuid4())
-    sessions[session_id] = SessionContext(session_id=session_id, call_sid=CallSid)
     await log_event(
         session_id,
         "twilio_call_started",
@@ -288,7 +275,9 @@ async def twilio_voice_webhook(
 @app.post("/calls/start")
 async def start_call(payload: dict[str, Any]) -> dict[str, str]:
     session_id = payload.get("session_id") or str(uuid.uuid4())
-    sessions[session_id] = SessionContext(session_id=session_id)
+    state = call_state_manager.create(session_id, payload.get("call_sid"))
+    state.prompt_version = PROMPT_VERSION
+    sessions[session_id] = state
     await log_event(session_id, "call_started", payload)
     return {"session_id": session_id}
 
@@ -296,14 +285,16 @@ async def start_call(payload: dict[str, Any]) -> dict[str, str]:
 @app.post("/demo/text-turn")
 async def demo_text_turn(request: TextTurnRequest) -> dict[str, Any]:
     session_id = request.session_id or str(uuid.uuid4())
-    session = sessions.setdefault(session_id, SessionContext(session_id=session_id))
+    session = sessions.get(session_id) or call_state_manager.get(session_id) or call_state_manager.create(session_id, None)
+    session.prompt_version = PROMPT_VERSION
+    sessions[session_id] = session
     result = await process_transcript(session, request.transcript)
     return {
         "session_id": session_id,
         "response_text": result["response_text"],
         "verified": session.verified,
-        "should_handoff": result.get("should_handoff", False),
-        "handoff_reason": result.get("handoff_reason"),
+        "should_handoff": session.should_handoff,
+        "handoff_reason": session.handoff_reason,
     }
 
 
@@ -315,7 +306,9 @@ async def session_log(session_id: str) -> list[dict[str, Any]]:
 @app.websocket("/ws/cartesia/{session_id}")
 async def cartesia_stream(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
-    session = sessions.setdefault(session_id, SessionContext(session_id=session_id))
+    session = sessions.get(session_id) or call_state_manager.get(session_id) or call_state_manager.create(session_id, None)
+    session.prompt_version = PROMPT_VERSION
+    sessions[session_id] = session
     try:
         while True:
             message = await websocket.receive()
@@ -333,7 +326,7 @@ async def cartesia_stream(websocket: WebSocket, session_id: str) -> None:
 @app.websocket("/ws/twilio-media")
 async def twilio_media_stream(websocket: WebSocket) -> None:
     await websocket.accept()
-    session: SessionContext | None = None
+    session: CallState | None = None
     try:
         while True:
             message = await websocket.receive()
@@ -341,7 +334,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 logger.info(
                     "twilio_media_disconnect session_id=%s stream_sid=%s code=%s",
                     session.session_id if session is not None else None,
-                    session.stream_id if session is not None else None,
+                    session.stream_sid if session is not None else None,
                     message.get("code"),
                 )
                 break
@@ -350,7 +343,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 logger.info(
                     "twilio_media_nontext session_id=%s stream_sid=%s message_type=%s",
                     session.session_id if session is not None else None,
-                    session.stream_id if session is not None else None,
+                    session.stream_sid if session is not None else None,
                     message["type"],
                 )
                 continue
@@ -365,18 +358,20 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 start = event.get("start", {})
                 params = start.get("customParameters", {})
                 session_id = params.get("session_id") or str(uuid.uuid4())
-                session = sessions.setdefault(session_id, SessionContext(session_id=session_id))
-                session.stream_id = event.get("streamSid")
+                session = sessions.get(session_id) or call_state_manager.get(session_id) or call_state_manager.create(session_id, start.get("callSid"))
+                session.prompt_version = PROMPT_VERSION
+                sessions[session_id] = session
+                session.stream_sid = event.get("streamSid")
                 session.call_sid = start.get("callSid")
                 session.ink_stream = await get_transcriber().open_twilio_turn_stream(session, websocket)
-                logger.info("twilio_media_start session_id=%s call_sid=%s stream_sid=%s", session.session_id, session.call_sid, session.stream_id)
+                logger.info("twilio_media_start session_id=%s call_sid=%s stream_sid=%s", session.session_id, session.call_sid, session.stream_sid)
                 await log_event(session.session_id, "twilio_stream_start", event)
                 schedule_response_task(
                     session,
                     send_twilio_response(
                         websocket,
                         session,
-                        "Thanks for calling. Please share your policy number and the last four digits of your Social Security number.",
+                        GREETING_PROMPT,
                     ),
                 )
                 continue
@@ -388,15 +383,16 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 continue
 
             if event_type == "dtmf" and session is not None:
-                logger.info("twilio_dtmf session_id=%s stream_sid=%s", session.session_id, session.stream_id)
+                logger.info("twilio_dtmf session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
                 await log_event(session.session_id, "twilio_dtmf", event)
                 continue
 
             if event_type == "stop" and session is not None:
-                logger.info("twilio_media_stop session_id=%s stream_sid=%s", session.session_id, session.stream_id)
+                logger.info("twilio_media_stop session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
                 await log_event(session.session_id, "twilio_stream_stop", event)
                 await cancel_session_tasks(session)
                 await get_transcriber().close_turn_stream(session)
+                await finalize_call(session, resolved=session.resolved)
                 break
         if session is not None:
             await cancel_session_tasks(session)
@@ -406,22 +402,23 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
         logger.exception(
             "twilio_media_exception session_id=%s stream_sid=%s",
             session.session_id if session is not None else None,
-            session.stream_id if session is not None else None,
+            session.stream_sid if session is not None else None,
         )
         if session is not None:
             await cancel_session_tasks(session)
             await get_transcriber().close_turn_stream(session)
             await fail_safe_handoff(websocket, session, f"twilio_exception:{exc}", transport="twilio")
+            await finalize_call(session, resolved=session.resolved)
         else:
             await websocket.close(code=1011)
 
 
-async def handle_websocket_event(websocket: WebSocket, session: SessionContext, event: dict[str, Any]) -> None:
+async def handle_websocket_event(websocket: WebSocket, session: CallState, event: dict[str, Any]) -> None:
     event_type = event.get("event")
     if event_type == "start":
-        session.stream_id = event.get("stream_id") or str(uuid.uuid4())
+        session.stream_sid = event.get("stream_id") or str(uuid.uuid4())
         await log_event(session.session_id, "stream_start", event)
-        await websocket.send_json({"event": "ack", "stream_id": session.stream_id, "config": event.get("config", {})})
+        await websocket.send_json({"event": "ack", "stream_id": session.stream_sid, "config": event.get("config", {})})
         return
     if event_type == "media_input":
         logger.info("cartesia_media_input_ignored session_id=%s", session.session_id)
@@ -436,17 +433,22 @@ async def handle_websocket_event(websocket: WebSocket, session: SessionContext, 
     raise HTTPException(status_code=400, detail=f"Unsupported event: {event_type}")
 
 
-async def process_transcript(session: SessionContext, transcript: str) -> GraphState:
+async def process_transcript(session: CallState, transcript: str) -> GraphState:
     await log_event(session.session_id, "user_transcript", {"text": transcript})
     if any(word in transcript.lower() for word in ("human", "representative", "agent")):
         session.human_requests += 1
         if session.human_requests >= 2:
             payload = await trigger_handoff(session.session_id, "human_requested_twice", transcript)
-            response_text = "I’m connecting you with a human representative now."
+            session.should_handoff = True
+            session.handoff_reason = "human_requested_twice"
+            response_text = HUMAN_REQUESTED_TWICE_PROMPT
             await log_event(session.session_id, "llm_response", {"text": response_text, "handoff": True})
+            session.add_turn("user", transcript)
+            session.add_turn("assistant", response_text)
             return {
                 "session_id": session.session_id,
                 "transcript": transcript,
+                "call_state": session,
                 "response_text": response_text,
                 "should_handoff": True,
                 "handoff_reason": "human_requested_twice",
@@ -455,32 +457,20 @@ async def process_transcript(session: SessionContext, transcript: str) -> GraphS
     state: GraphState = {
         "session_id": session.session_id,
         "transcript": transcript,
-        "history": session.history,
-        "verified": session.verified,
-        "policy_number": session.policy_number,
-        "ssn_last4": session.ssn_last4,
-        "verification_attempts": session.verification_attempts,
-        "should_handoff": False,
-        "handoff_reason": None,
+        "call_state": session,
+        "should_handoff": session.should_handoff,
+        "handoff_reason": session.handoff_reason,
         "llm_error": None,
     }
     result = await get_orchestrator().run_turn(state)
-    session.verified = result.get("verified", session.verified)
-    session.policy_number = result.get("policy_number", session.policy_number)
-    session.ssn_last4 = result.get("ssn_last4", session.ssn_last4)
-    session.verification_attempts = result.get("verification_attempts", session.verification_attempts)
-    session.history.extend(
-        [
-            {"role": "user", "content": transcript},
-            {"role": "assistant", "content": result["response_text"]},
-        ]
-    )
+    session.add_turn("user", transcript)
+    session.add_turn("assistant", result["response_text"])
     return result
 
 
 async def send_agent_response(
     websocket: WebSocket,
-    session: SessionContext,
+    session: CallState,
     text: str,
     transport: str = "cartesia",
     *,
@@ -494,23 +484,25 @@ async def send_agent_response(
         await websocket.send_json(
             {
                 "event": "media_output",
-                "stream_id": session.stream_id,
+                "stream_id": session.stream_sid,
                 "media": {"payload": chunk},
                 "text": text,
             }
         )
 
 
-async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reason: str, transport: str = "cartesia") -> None:
+async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: str, transport: str = "cartesia") -> None:
     payload = await trigger_handoff(session.session_id, reason, "Automatic fallback handoff")
+    session.should_handoff = True
+    session.handoff_reason = reason
     if transport == "twilio":
         try:
-            await send_twilio_response(websocket, session, "I’m transferring you to a human representative.")
+            await send_twilio_response(websocket, session, HUMAN_HANDOFF_PROMPT)
             await websocket.send_text(
                 json.dumps(
                     {
                         "event": "mark",
-                        "streamSid": session.stream_id,
+                        "streamSid": session.stream_sid,
                         "mark": {"name": payload["reason_code"]},
                     }
                 )
@@ -520,17 +512,17 @@ async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reaso
             logger.info(
                 "twilio_handoff_socket_closed session_id=%s stream_sid=%s reason=%s",
                 session.session_id,
-                session.stream_id,
+                session.stream_sid,
                 payload["reason_code"],
             )
         return
     await websocket.send_json(
         {
             "event": "transfer_call",
-            "stream_id": session.stream_id,
+            "stream_id": session.stream_sid,
             "transfer": {"target_phone_number": os.getenv("HUMAN_HANDOFF_NUMBER", "+15555550199")},
             "reason": payload["reason_code"],
-            "text": "I’m transferring you to a human representative.",
+            "text": HUMAN_HANDOFF_PROMPT,
         }
     )
     await websocket.close(code=1011)
@@ -538,7 +530,7 @@ async def fail_safe_handoff(websocket: WebSocket, session: SessionContext, reaso
 
 async def send_twilio_response(
     websocket: WebSocket,
-    session: SessionContext,
+    session: CallState,
     text: str,
     *,
     latency_t0: float | None = None,
@@ -557,7 +549,7 @@ async def send_twilio_response(
                     json.dumps(
                         {
                             "event": "media",
-                            "streamSid": session.stream_id,
+                            "streamSid": session.stream_sid,
                             "media": {"payload": payload},
                         }
                     )
@@ -569,7 +561,7 @@ async def send_twilio_response(
                 json.dumps(
                     {
                         "event": "mark",
-                        "streamSid": session.stream_id,
+                        "streamSid": session.stream_sid,
                         "mark": {"name": f"response-{uuid.uuid4()}"},
                     }
                 )
@@ -581,7 +573,7 @@ async def send_twilio_response(
 
 
 async def handle_completed_turn(
-    session: SessionContext,
+    session: CallState,
     websocket: WebSocket,
     transcript: str,
     latency_t0: float,
@@ -601,9 +593,12 @@ async def handle_completed_turn(
             return
     await send_agent_response(websocket, session, result["response_text"], transport="twilio", latency_t0=latency_t0)
     session.pending_transcript = None
+    if session.should_close:
+        await finalize_call(session, resolved=session.resolved)
+        await websocket.close(code=1000)
 
 
-def schedule_response_task(session: SessionContext, coroutine: Any) -> None:
+def schedule_response_task(session: CallState, coroutine: Any) -> None:
     if session.active_response_task is not None and not session.active_response_task.done():
         session.active_response_task.cancel()
     task = asyncio.create_task(coroutine)
@@ -616,7 +611,7 @@ def schedule_response_task(session: SessionContext, coroutine: Any) -> None:
     task.add_done_callback(_clear_task)
 
 
-async def cancel_session_tasks(session: SessionContext) -> None:
+async def cancel_session_tasks(session: CallState) -> None:
     tasks = [session.active_response_task, session.active_tts_task]
     session.active_response_task = None
     session.active_tts_task = None
@@ -635,13 +630,21 @@ async def cancel_session_tasks(session: SessionContext) -> None:
                 logger.exception("session_task_cancel_exception session_id=%s", session.session_id)
 
 
-async def interrupt_twilio_playback(websocket: WebSocket, session: SessionContext) -> None:
+async def interrupt_twilio_playback(websocket: WebSocket, session: CallState) -> None:
     if not session.tts_playing and session.active_response_task is None:
         return
-    logger.info("twilio_barge_in session_id=%s stream_sid=%s", session.session_id, session.stream_id)
-    if session.stream_id:
-        await websocket.send_json({"event": "clear", "streamSid": session.stream_id})
+    logger.info("twilio_barge_in session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
+    if session.stream_sid:
+        await websocket.send_json({"event": "clear", "streamSid": session.stream_sid})
     await cancel_session_tasks(session)
+
+
+async def finalize_call(session: CallState, resolved: bool = False) -> None:
+    final_state = call_state_manager.end(session.session_id or session.call_id, resolved=resolved)
+    if final_state is None:
+        return
+    sessions.pop(final_state.session_id or "", None)
+    await persist_call_record(final_state, await ensure_pool())
 
 
 def build_twilio_stream_url(request: Request) -> str:

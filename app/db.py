@@ -58,6 +58,32 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS calls (
+        call_id UUID PRIMARY KEY,
+        call_sid TEXT,
+        session_id UUID,
+        started_at TIMESTAMPTZ,
+        ended_at TIMESTAMPTZ,
+        duration_seconds FLOAT,
+        verified BOOLEAN,
+        policy_number TEXT,
+        turn_count INTEGER,
+        resolved BOOLEAN,
+        handoff_reason TEXT,
+        answered_queries TEXT,
+        prompt_version TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS call_turns (
+        id SERIAL PRIMARY KEY,
+        call_id UUID REFERENCES calls(call_id),
+        turn_index INTEGER,
+        role TEXT,
+        content TEXT
+    )
+    """,
+    """
     CREATE OR REPLACE FUNCTION prevent_compliance_log_mutation()
     RETURNS trigger AS $$
     BEGIN

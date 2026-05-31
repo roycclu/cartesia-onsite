@@ -9,7 +9,22 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, StateGraph
 from openai import AsyncOpenAI
 
+from app.call_state import CallState
 from app.compliance import log_event
+from app.prompts import (
+    END_CONVERSATION_PROMPT,
+    INTENT_CLASSIFICATION_PROMPT,
+    LLM_ERROR_PROMPT,
+    LLM_RESPONSE_PROMPT,
+    OUT_OF_SCOPE_PROMPT,
+    PROMPT_VERSION,
+    REPEATED_QUERY_INSTRUCTION,
+    VERIFICATION_FAILED_HANDOFF_PROMPT,
+    VERIFICATION_REQUIRED_PROMPT,
+    VERIFICATION_SUCCESS_PROMPT,
+    VERIFICATION_SUCCESS_WITH_PENDING,
+    WRITE_REQUEST_PROMPT,
+)
 from app.tools import get_claim_status, get_policy_info, normalize_policy_number, trigger_handoff, verify_identity
 
 logger = logging.getLogger("voice_agent")
@@ -27,6 +42,7 @@ ALLOWED_INTENTS = {
     "handoff",
     "out_of_scope",
     "write_request",
+    "end_conversation",
     "unknown",
 }
 
@@ -37,6 +53,7 @@ Intent = Literal[
     "handoff",
     "out_of_scope",
     "write_request",
+    "end_conversation",
     "unknown",
 ]
 
@@ -44,17 +61,14 @@ Intent = Literal[
 class GraphState(TypedDict, total=False):
     session_id: str
     transcript: str
-    history: list[dict[str, str]]
-    verified: bool
-    policy_number: str | None
-    ssn_last4: str | None
+    call_state: CallState
     intent: Intent
     tool_result: dict[str, Any] | None
     response_text: str
     should_handoff: bool
     handoff_reason: str | None
     llm_error: str | None
-    verification_attempts: int
+    repeated_query: bool
 
 
 class LLMHelper:
@@ -65,6 +79,8 @@ class LLMHelper:
 
     async def classify_intent(self, transcript: str) -> Intent:
         lowered = transcript.lower()
+        if any(phrase in lowered for phrase in ("that's all", "that is all", "all set", "no that's it", "no that is it")):
+            return "end_conversation"
         if any(phrase in lowered for phrase in ("representative", "human", "agent")):
             return "handoff"
         if any(phrase in lowered for phrase in ("update my", "change my", "file a claim", "cancel my policy", "pay my bill")):
@@ -77,11 +93,7 @@ class LLMHelper:
             return "get_policy_info"
         if self.client is None:
             return "unknown"
-        prompt = (
-            "Classify the insurance call center request into one of: "
-            "get_claim_status, get_policy_info, handoff, out_of_scope, write_request, unknown. "
-            f"Transcript: {transcript}"
-        )
+        prompt = INTENT_CLASSIFICATION_PROMPT.format(transcript=transcript)
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 response = await self.client.responses.create(model=self.model, input=prompt)
@@ -91,13 +103,11 @@ class LLMHelper:
             return "unknown"
 
     async def generate_response(self, state: GraphState) -> str:
-        prompt = (
-            "You are a concise insurance call center voice agent. "
-            "The caller has already been verified. "
-            "Answer briefly and directly based on the current state. "
-            "Do not ask for verification details again. "
-            "Use the state below and produce a short spoken response.\n"
-            f"State: {state}"
+        call_state = state["call_state"]
+        repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
+        prompt = LLM_RESPONSE_PROMPT.format(
+            repeated_query_instruction=repeated_instruction,
+            state=call_state.to_llm_state(),
         )
         logger.info("TURN [%s] PROMPT: %s", state["session_id"], prompt)
         if self.client is None:
@@ -117,28 +127,35 @@ class LLMHelper:
             return text
 
     def _fallback_response(self, state: GraphState) -> str:
-        if state.get("should_handoff"):
-            return "I’m transferring you to a human representative for further help."
+        call_state = state["call_state"]
         result = state.get("tool_result") or {}
-        if state["intent"] == "get_claim_status":
+        intent = state.get("intent", "unknown")
+        if call_state.should_handoff:
+            return VERIFICATION_FAILED_HANDOFF_PROMPT if call_state.handoff_reason == "verification_failed" else OUT_OF_SCOPE_PROMPT
+        if state.get("repeated_query"):
+            if intent == "get_claim_status" and "claim_id" in result:
+                return f"As I mentioned, your claim {result['claim_id']} is {result['status']}."
+            if intent == "get_policy_info" and "coverage_type" in result:
+                return f"As I mentioned, your policy is {result['coverage_type']} with a deductible of {result['deductible']} dollars."
+        if intent == "end_conversation":
+            return END_CONVERSATION_PROMPT
+        if intent == "get_claim_status":
             if "error" in result:
                 return result["error"]
             return (
                 f"Your claim {result['claim_id']} is {result['status']}. "
                 f"It was last updated on {result['last_updated']} by adjuster {result['adjuster_name']}."
             )
-        if state["intent"] == "get_policy_info":
+        if intent == "get_policy_info":
             if "error" in result:
                 return result["error"]
             return (
                 f"Your policy is {result['coverage_type']} with a coverage limit of {result['coverage_limit']} dollars "
                 f"and a deductible of {result['deductible']} dollars."
             )
-        if state["intent"] == "write_request":
-            return "I can’t make account changes in this demo, so I’m connecting you with a human representative."
-        if state["intent"] == "out_of_scope":
-            return "That request is outside this insurance support demo, so I’m transferring you to a human representative."
-        return "Identity verified. How can I help you today? I can check your claim status or answer policy questions."
+        if call_state.verified:
+            return VERIFICATION_SUCCESS_PROMPT
+        return VERIFICATION_REQUIRED_PROMPT
 
 
 class InsuranceOrchestrator:
@@ -155,10 +172,7 @@ class InsuranceOrchestrator:
         graph.add_conditional_edges(
             "verification",
             self._route_after_verification,
-            {
-                "end": END,
-                "intent_classification": "intent_classification",
-            },
+            {"end": END, "intent_classification": "intent_classification"},
         )
         graph.add_edge("intent_classification", "tool_execution")
         graph.add_edge("tool_execution", "response_generation")
@@ -167,68 +181,55 @@ class InsuranceOrchestrator:
 
     async def run_turn(self, state: GraphState) -> GraphState:
         result = await self.graph.ainvoke(state)
-        await log_event(result["session_id"], "graph_result", result)
+        await log_event(result["session_id"], "graph_result", {"prompt_version": PROMPT_VERSION, "state": result["call_state"].to_llm_state()})
         return result
 
     async def _extract_fields_node(self, state: GraphState) -> GraphState:
+        call_state = state["call_state"]
         extracted = extract_fields(state["transcript"])
-        extracted_policy = extracted["policy_number"]
-        extracted_ssn = extracted["ssn_last4"]
-        if extracted["policy_number"]:
-            state["policy_number"] = extracted["policy_number"]
-        if extracted["ssn_last4"]:
-            state["ssn_last4"] = extracted["ssn_last4"]
+        call_state.merge_extracted_fields(extracted)
         logger.info(
             "EXTRACT [%s] raw_transcript=%r extracted_policy=%r extracted_ssn=%r",
             state["session_id"],
             state["transcript"],
-            extracted_policy,
-            extracted_ssn,
+            extracted.get("policy_number"),
+            extracted.get("ssn_last4"),
         )
         await log_event(
             state["session_id"],
             "field_extraction",
             {
                 "transcript": state["transcript"],
-                "policy_number": state.get("policy_number"),
-                "ssn_last4": state.get("ssn_last4"),
+                "policy_number": call_state.policy_number,
+                "ssn_last4": call_state.ssn_last4,
             },
         )
         return state
 
     async def _verification_node(self, state: GraphState) -> GraphState:
-        if state.get("verified"):
+        call_state = state["call_state"]
+        if call_state.verified:
             return state
 
-        transcript = state["transcript"]
-        policy_number = state.get("policy_number")
-        ssn_last4 = state.get("ssn_last4")
-        both_present = bool(policy_number and ssn_last4)
+        policy_number = call_state.policy_number
+        ssn_last4 = call_state.ssn_last4
         logger.info(
             "VERIFY_CHECK [%s] state_policy=%r state_ssn=%r both_present=%s",
             state["session_id"],
             policy_number,
             ssn_last4,
-            both_present,
+            bool(policy_number and ssn_last4),
         )
 
         if not policy_number or not ssn_last4:
-            state["tool_result"] = {
-                "verified": False,
-                "message": "To verify your identity I need your policy number and the last 4 digits of your Social Security number. Please provide both.",
-            }
-            state["response_text"] = "To verify your identity I need your policy number and the last 4 digits of your Social Security number. Please provide both."
+            state["tool_result"] = {"verified": False, "message": VERIFICATION_REQUIRED_PROMPT}
+            state["response_text"] = VERIFICATION_REQUIRED_PROMPT
             return state
 
-        logger.info(
-            "VERIFY_CALL [%s] calling verify_identity with policy=%r ssn=%r",
-            state["session_id"],
-            policy_number,
-            ssn_last4,
-        )
+        logger.info("VERIFY_CALL [%s] calling verify_identity with policy=%r ssn=%r", state["session_id"], policy_number, ssn_last4)
         verification = await verify_identity(state["session_id"], policy_number, ssn_last4)
         state["tool_result"] = verification
-        state["policy_number"] = verification.get("policy_number", policy_number)
+        call_state.policy_number = verification.get("policy_number", call_state.policy_number)
         logger.info(
             "VERIFY_RESULT [%s] verified=%s holder=%r message=%r",
             state["session_id"],
@@ -238,105 +239,123 @@ class InsuranceOrchestrator:
         )
 
         if verification["verified"]:
-            state["verified"] = True
-            state["verification_attempts"] = 0
-            state["response_text"] = "Identity verified. How can I help you today?"
+            call_state.verified = True
+            call_state.verification_attempts = 0
+            if call_state.pending_intent:
+                state["response_text"] = VERIFICATION_SUCCESS_WITH_PENDING.format(
+                    pending_intent=call_state.pending_intent.replace("_", " ")
+                )
+                call_state.pending_intent = None
+            else:
+                state["response_text"] = VERIFICATION_SUCCESS_PROMPT
             return state
 
-        state["verification_attempts"] = state.get("verification_attempts", 0) + 1
-        if state["verification_attempts"] >= 3:
+        call_state.verification_attempts += 1
+        if call_state.verification_attempts >= 3:
+            call_state.should_handoff = True
+            call_state.handoff_reason = "verification_failed"
             state["should_handoff"] = True
             state["handoff_reason"] = "verification_failed"
-            state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", transcript)
-            state["response_text"] = "I’m transferring you to a human representative."
+            state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", state["transcript"])
+            state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
             return state
 
-        state["response_text"] = "I need your policy number and last 4 digits of your SSN."
+        state["response_text"] = VERIFICATION_REQUIRED_PROMPT
         return state
 
     def _route_after_verification(self, state: GraphState) -> str:
-        if not state.get("verified") or state.get("response_text") or state.get("should_handoff"):
+        if state["response_text"] or state["call_state"].should_handoff:
             return "end"
         return "intent_classification"
 
     async def _classify_intent(self, state: GraphState) -> GraphState:
-        state["intent"] = await self.llm.classify_intent(state["transcript"])
-        await log_event(
-            state["session_id"],
-            "intent_classification",
-            {"transcript": state["transcript"], "intent": state["intent"]},
-        )
+        call_state = state["call_state"]
+        intent = await self.llm.classify_intent(state["transcript"])
+        state["intent"] = intent
+        call_state.capture_pending_intent(intent)
+        await log_event(state["session_id"], "intent_classification", {"transcript": state["transcript"], "intent": intent})
         return state
 
     async def _execute_tools(self, state: GraphState) -> GraphState:
+        call_state = state["call_state"]
         intent = state["intent"]
         transcript = state["transcript"]
-        policy_number = state.get("policy_number")
+
+        if intent == "end_conversation":
+            call_state.should_close = True
+            call_state.resolved = True
+            state["tool_result"] = {"message": END_CONVERSATION_PROMPT}
+            return state
 
         if intent == "handoff":
+            call_state.should_handoff = True
+            call_state.handoff_reason = "human_requested"
             state["should_handoff"] = True
             state["handoff_reason"] = "human_requested"
             state["tool_result"] = await trigger_handoff(state["session_id"], "human_requested", transcript)
             return state
 
         if intent in {"write_request", "out_of_scope"}:
+            call_state.should_handoff = True
+            call_state.handoff_reason = intent
             state["should_handoff"] = True
             state["handoff_reason"] = intent
             state["tool_result"] = await trigger_handoff(state["session_id"], intent, transcript)
             return state
 
+        if call_state.already_answered(intent):
+            state["repeated_query"] = True
+            state["tool_result"] = call_state.answered_queries[intent]
+            return state
+
         if intent == "get_claim_status":
-            state["tool_result"] = await get_claim_status(state["session_id"], policy_number or "")
+            result = await get_claim_status(state["session_id"], call_state.policy_number or "")
+            call_state.record_answered_query(intent, result)
+            state["tool_result"] = result
         elif intent == "get_policy_info":
-            state["tool_result"] = await get_policy_info(state["session_id"], policy_number or "")
+            result = await get_policy_info(state["session_id"], call_state.policy_number or "")
+            call_state.record_answered_query(intent, result)
+            state["tool_result"] = result
         else:
-            state["tool_result"] = {"message": "Identity verified. How can I help you today?"}
+            state["tool_result"] = {"message": VERIFICATION_SUCCESS_PROMPT}
         return state
 
     async def _generate_response(self, state: GraphState) -> GraphState:
         logger.info(
             "LLM_INPUT [%s] verified=%s proceeding_to_intent=%s",
             state["session_id"],
-            state.get("verified", False),
-            state.get("verified", False),
+            state["call_state"].verified,
+            state["call_state"].verified,
         )
         response = await self.llm.generate_response(state)
         state["response_text"] = response
         if state.get("llm_error"):
-            state["should_handoff"] = True
-            state["handoff_reason"] = "llm_error"
+            state["call_state"].should_handoff = True
+            state["call_state"].handoff_reason = "llm_error"
             state["tool_result"] = await trigger_handoff(state["session_id"], "llm_error", state["transcript"])
-            state["response_text"] = "I’m having trouble completing that request. I’ll connect you with a human representative."
+            state["response_text"] = LLM_ERROR_PROMPT
         await log_event(
             state["session_id"],
             "llm_response",
-            {"text": state["response_text"], "handoff": state.get("should_handoff", False)},
+            {"text": state["response_text"], "handoff": state["call_state"].should_handoff},
         )
         return state
 
 
 def extract_fields(transcript: str) -> dict[str, str | None]:
     lower = transcript.lower()
-
-    # Only search for policy number in the portion before any SSN keyword.
-    # Without this, the regex can match the SSN digits against a preceding
-    # word (e.g. "is 4821") and normalize_policy_number turns it into POL4821.
     split_at = len(transcript)
     for kw in ("social", "ssn", "last four"):
         idx = lower.find(kw)
         if idx != -1:
             split_at = min(split_at, idx)
     policy_section = transcript[:split_at]
-
-    # Collapse intra-word hyphens so STT artifacts like "POL1O-O1" → "POL1OO1"
-    # before the digit pattern runs.
     policy_section_clean = re.sub(r"(?<=[A-Za-z0-9])-(?=[A-Za-z0-9])", "", policy_section)
 
     policy_number = None
     policy_match = POLICY_PATTERN.search(policy_section_clean)
     if policy_match:
         prefix = policy_match.group(1).upper()
-        # Normalize common STT confusions in digit positions: O→0, I→1
         digits = policy_match.group(2).upper().replace("O", "0").replace("I", "1")
         policy_number = normalize_policy_number(f"{prefix}{digits}")
 
@@ -344,14 +363,9 @@ def extract_fields(transcript: str) -> dict[str, str | None]:
     if ssn_match:
         ssn_last4 = ssn_match.group(1)
     elif any(kw in lower for kw in ("ssn", "last four", "social")):
-        # Only fall back to bare-digit search when an SSN keyword was spoken,
-        # otherwise the policy digits get grabbed as the SSN.
         fallback_matches = SSN_PATTERN.findall(transcript)
         ssn_last4 = fallback_matches[-1] if fallback_matches else None
     else:
         ssn_last4 = None
 
-    return {
-        "policy_number": policy_number,
-        "ssn_last4": ssn_last4,
-    }
+    return {"policy_number": policy_number, "ssn_last4": ssn_last4}
