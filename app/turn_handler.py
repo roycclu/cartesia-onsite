@@ -35,7 +35,11 @@ async def process_transcript(session: CallState, transcript: str) -> GraphState:
             session.should_handoff = True
             session.handoff_reason = "human_requested_twice"
             response_text = HUMAN_REQUESTED_TWICE_PROMPT
-            await log_event(session.session_id, "llm_response", {"text": response_text, "handoff": True})
+            await log_event(
+                session.session_id,
+                "llm_response",
+                {"text": response_text, "handoff": True, "turn_id": session.current_turn_id},
+            )
             session.add_turn("user", transcript)
             session.add_turn("assistant", response_text)
             return {
@@ -137,6 +141,11 @@ async def resolve_speculative_turn(session: CallState, websocket: WebSocket, tra
     similarity = transcript_similarity(speculative_transcript, transcript)
     hit = similarity >= 0.80
     logger.info("SPECULATIVE [%s] similarity=%.2f outcome=%s", session.session_id, similarity, "hit" if hit else "miss")
+    await log_event(
+        session.session_id,
+        "speculative_resolution",
+        {"turn_id": session.current_turn_id, "similarity": round(similarity, 4), "outcome": "hit" if hit else "miss"},
+    )
     if hit:
         session.pending_transcript = None
         session.speculative_transcript = None
@@ -202,7 +211,12 @@ async def handle_completed_turn(
         session.response_buffer.start()
         session.current_latency_t0 = latency_t0
         result = await process_transcript(session, transcript)
-        logger.info("LATENCY [%s] llm_response_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
+        logger.info(
+            "LATENCY [%s] turn_id=%s llm_response_ms=%s",
+            session.session_id,
+            session.current_turn_id,
+            int((time.time() - latency_t0) * 1000),
+        )
         response_text = result.get("response_text") or result.get("response") or ""
         if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0 and response_text:
             await send_agent_response(websocket, session, response_text, transport="twilio", latency_t0=latency_t0)

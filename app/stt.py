@@ -101,17 +101,22 @@ class CartesiaTranscriber:
                     await log_event(session.session_id, "cartesia_stt_connected", message)
                     continue
                 if event_type == "turn.start":
+                    turn_id = session.start_new_turn()
                     await interrupt_twilio_playback(twilio_ws, session)
-                    await log_event(session.session_id, "turn_start", message)
+                    await log_event(session.session_id, "turn_start", {**message, "turn_id": turn_id})
                     continue
                 if event_type in {"turn.update", "turn.resume"}:
                     transcript = (message.get("transcript") or "").strip()
                     if transcript:
                         await maybe_prefetch_from_partial(session, transcript)
-                    await log_event(session.session_id, event_type.replace(".", "_"), message)
+                    await log_event(
+                        session.session_id,
+                        event_type.replace(".", "_"),
+                        {**message, "turn_id": session.current_turn_id},
+                    )
                     continue
                 if event_type == "turn.eager_end":
-                    await log_event(session.session_id, "turn_eager_end", message)
+                    await log_event(session.session_id, "turn_eager_end", {**message, "turn_id": session.current_turn_id})
                     transcript = (message.get("transcript") or "").strip()
                     if transcript and should_process_transcript(transcript):
                         t0 = time.time()
@@ -121,7 +126,11 @@ class CartesiaTranscriber:
                 if event_type == "turn.end":
                     transcript = (message.get("transcript") or "").strip()
                     logger.info("TURN [%s] USER: %s", session.session_id, transcript)
-                    await log_event(session.session_id, "asr_result", {"text": transcript, "provider": "cartesia_ink_2"})
+                    await log_event(
+                        session.session_id,
+                        "asr_result",
+                        {"text": transcript, "provider": "cartesia_ink_2", "turn_id": session.current_turn_id},
+                    )
                     if transcript and should_process_transcript(transcript):
                         if await resolve_speculative_turn(session, twilio_ws, transcript):
                             continue

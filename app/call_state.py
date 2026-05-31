@@ -29,6 +29,7 @@ class CallState:
     last_verification_failed: bool = False
     holder_name: Optional[str] = None
     verification_attempts: int = 0
+    post_verification_greeted: bool = False
 
     history: list[dict[str, str]] = field(default_factory=list)
     pending_intent: Optional[str] = None
@@ -63,6 +64,7 @@ class CallState:
     interrupted: bool = False
     twilio_websocket: Any = field(default=None, repr=False)
     current_latency_t0: float | None = None
+    current_turn_id: str | None = None
 
     def merge_extracted_fields(self, extracted: dict[str, Any]) -> None:
         if extracted.get("policy_number") and not self.policy_number:
@@ -80,6 +82,10 @@ class CallState:
         if not self.verified and intent not in ("verify_identity", "unknown"):
             self.pending_intent = intent
             self.pending_intent_transcript = transcript
+
+    def start_new_turn(self) -> str:
+        self.current_turn_id = str(uuid.uuid4())[:8]
+        return self.current_turn_id
 
     def record_answered_query(self, query_type: str, result: dict[str, Any]) -> None:
         self.answered_queries[query_type] = result

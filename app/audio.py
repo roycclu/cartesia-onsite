@@ -94,6 +94,21 @@ async def send_opening_greeting(websocket: WebSocket, session: CallState) -> Non
     await send_twilio_response(websocket, session, greeting)
 
 
+async def log_first_audio(session: CallState, latency_t0: float) -> None:
+    latency_ms = int((time.time() - latency_t0) * 1000)
+    logger.info(
+        "LATENCY [%s] turn_id=%s eager_end_to_first_audio_ms=%s",
+        session.session_id,
+        session.current_turn_id,
+        latency_ms,
+    )
+    await log_event(
+        session.session_id,
+        "first_audio",
+        {"turn_id": session.current_turn_id, "eager_end_to_first_audio_ms": latency_ms},
+    )
+
+
 async def send_twilio_response(
     websocket: WebSocket,
     session: CallState,
@@ -133,7 +148,7 @@ async def send_twilio_response(
                     return
                 await send_twilio_media_frame(websocket, session.stream_sid, padded_frame)
                 if latency_t0 is not None and not first_audio_logged:
-                    logger.info("LATENCY [%s] eager_end_to_first_audio_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
+                    await log_first_audio(session, latency_t0)
                     first_audio_logged = True
                 await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
                 mulaw_buffer.clear()
@@ -217,7 +232,7 @@ async def send_audio_to_twilio(
         del bytes_buffer[:TWILIO_FRAME_SIZE]
         await send_twilio_media_frame(websocket, session.stream_sid, frame)
         if latency_t0 is not None and not first_audio_logged:
-            logger.info("LATENCY [%s] eager_end_to_first_audio_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
+            await log_first_audio(session, latency_t0)
             first_audio_logged = True
         await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
     return first_audio_logged

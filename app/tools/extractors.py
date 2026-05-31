@@ -24,6 +24,10 @@ SSN_CONTEXT_PATTERN = re.compile(
     r"(?:ssn|social security number|last four(?: digits)?)\D*(\d{4})",
     re.IGNORECASE,
 )
+PARTIAL_SSN_CONTEXT_PATTERN = re.compile(
+    r"(?:ssn|social security number|social|last four(?: digits)?)\D*(\d{1,3})-(\d{1,3})(?!\d)",
+    re.IGNORECASE,
+)
 
 
 def normalize_policy_number(value: str) -> str:
@@ -81,6 +85,17 @@ def extract_fields(transcript: str) -> dict[str, str | None]:
         ssn_last4 = fallback_matches[-1] if fallback_matches else None
     else:
         ssn_last4 = None
+
+    partial_ssn_match = PARTIAL_SSN_CONTEXT_PATTERN.search(transcript)
+    if partial_ssn_match:
+        digit_count = len(partial_ssn_match.group(1)) + len(partial_ssn_match.group(2))
+        if digit_count < 4:
+            ssn_last4 = None
+
+    if ssn_last4 and policy_number:
+        policy_digits = "".join(char for char in policy_number if char.isdigit())
+        if policy_digits.endswith(ssn_last4):
+            ssn_last4 = None
 
     return {"policy_number": policy_number, "ssn_last4": ssn_last4}
 

@@ -378,8 +378,10 @@ class InsuranceOrchestrator:
             call_state.latest_tool_result = verification
             call_state.verification_attempts = 0
             call_state.last_verification_failed = False
-            holder_name = verification.get("holder_name")
             pending_intent = call_state.pending_intent
+            should_emit_transition = not call_state.post_verification_greeted
+            if should_emit_transition:
+                call_state.post_verification_greeted = True
             if pending_intent:
                 intent = pending_intent
                 transcript = call_state.pending_intent_transcript or state["transcript"]
@@ -390,7 +392,8 @@ class InsuranceOrchestrator:
                 logger.info("PENDING_INTENT_RESOLVED [%s] intent=%s", state["session_id"], intent)
                 state = await self._execute_tools(state)
                 return await self._generate_response(state)
-            state["response_text"] = await self.llm.generate_verification_success(holder_name, None)
+            if should_emit_transition:
+                state["response_text"] = "Thanks, you're all set. What can I help with?"
             return state
 
         if call_state.verification_attempts >= 3:
@@ -502,6 +505,10 @@ class InsuranceOrchestrator:
         await log_event(
             state["session_id"],
             "llm_response",
-            {"text": state["response_text"], "handoff": state["call_state"].should_handoff},
+            {
+                "text": state["response_text"],
+                "handoff": state["call_state"].should_handoff,
+                "turn_id": state["call_state"].current_turn_id,
+            },
         )
         return state

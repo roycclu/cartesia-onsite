@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import asyncpg
+
+
+@dataclass
+class TurnMetrics:
+    eager_end: datetime | None = None
+    turn_end: datetime | None = None
+    first_audio: datetime | None = None
+    speculative_outcome: str | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Report aggregate latency metrics from compliance logs.")
+    parser.add_argument("--hours", type=int, default=24, help="Lookback window in hours. Defaults to 24.")
+    return parser.parse_args()
 
 
 def parse_ts(value: str) -> datetime:
@@ -39,71 +55,53 @@ def fmt_pct(value: float | None) -> str:
     return f"{value:.1f}%"
 
 
-async def fetch_rows(conn: asyncpg.Connection, query: str) -> list[asyncpg.Record]:
-    return await conn.fetch(query)
+async def fetch_rows(conn: asyncpg.Connection, query: str, *params: Any) -> list[asyncpg.Record]:
+    return await conn.fetch(query, *params)
 
 
-def build_session_events(rows: list[asyncpg.Record]) -> dict[str, list[dict[str, Any]]]:
-    sessions: dict[str, list[dict[str, Any]]] = {}
+def build_turn_metrics(rows: list[asyncpg.Record]) -> dict[str, TurnMetrics]:
+    turns: dict[str, TurnMetrics] = {}
     for row in rows:
         payload = json.loads(row["content"])
-        event = {
-            "event_type": row["event_type"],
-            "timestamp": parse_ts(row["timestamp"]),
-            "content": payload,
-        }
-        sessions.setdefault(row["session_id"], []).append(event)
-    for events in sessions.values():
-        events.sort(key=lambda event: event["timestamp"])
-    return sessions
+        turn_id = payload.get("turn_id")
+        if not turn_id:
+            continue
+        turn = turns.setdefault(turn_id, TurnMetrics())
+        timestamp = parse_ts(row["timestamp"])
+        if row["event_type"] == "turn_eager_end":
+            turn.eager_end = timestamp
+        elif row["event_type"] == "asr_result":
+            turn.turn_end = timestamp
+        elif row["event_type"] == "first_audio":
+            turn.first_audio = timestamp
+        elif row["event_type"] == "speculative_resolution":
+            turn.speculative_outcome = payload.get("outcome")
+    return turns
 
 
-def analyze_sessions(sessions: dict[str, list[dict[str, Any]]]) -> tuple[list[float], list[float], int, int]:
-    perceived_latency_ms: list[float] = []
-    llm_response_ms: list[float] = []
-    speculative_hits = 0
+def analyze_turns(turns: dict[str, TurnMetrics]) -> tuple[list[float], list[float], int, int]:
+    eager_end_to_first_audio_ms: list[float] = []
+    turn_end_to_first_audio_ms: list[float] = []
     speculative_total = 0
+    speculative_hits = 0
 
-    for events in sessions.values():
-        pending_eager_end: datetime | None = None
-        pending_asr_result: datetime | None = None
-        awaiting_speculative = False
+    for turn in turns.values():
+        if turn.speculative_outcome is not None:
+            speculative_total += 1
+            if turn.speculative_outcome == "hit":
+                speculative_hits += 1
+        if turn.speculative_outcome == "miss":
+            continue
+        if turn.eager_end is not None and turn.first_audio is not None:
+            eager_end_to_first_audio_ms.append((turn.first_audio - turn.eager_end).total_seconds() * 1000)
+        if turn.turn_end is not None and turn.first_audio is not None:
+            turn_end_to_first_audio_ms.append((turn.first_audio - turn.turn_end).total_seconds() * 1000)
 
-        for event in events:
-            event_type = event["event_type"]
-            timestamp = event["timestamp"]
-
-            if event_type == "turn_eager_end":
-                transcript = (event["content"].get("transcript") or "").strip()
-                if transcript:
-                    pending_eager_end = timestamp
-                    awaiting_speculative = True
-                continue
-
-            if event_type == "asr_result":
-                pending_asr_result = timestamp
-                if awaiting_speculative:
-                    speculative_total += 1
-                continue
-
-            if event_type != "llm_response":
-                continue
-
-            if pending_eager_end is not None:
-                perceived_latency_ms.append((timestamp - pending_eager_end).total_seconds() * 1000)
-                if awaiting_speculative and pending_asr_result is None:
-                    speculative_hits += 1
-                pending_eager_end = None
-                awaiting_speculative = False
-
-            if pending_asr_result is not None:
-                llm_response_ms.append((timestamp - pending_asr_result).total_seconds() * 1000)
-                pending_asr_result = None
-
-    return perceived_latency_ms, llm_response_ms, speculative_hits, speculative_total
+    return eager_end_to_first_audio_ms, turn_end_to_first_audio_ms, speculative_hits, speculative_total
 
 
 async def main() -> None:
+    args = parse_args()
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise SystemExit("DATABASE_URL is required")
@@ -115,29 +113,34 @@ async def main() -> None:
             """
             SELECT session_id, event_type, content, timestamp
             FROM compliance_log
-            WHERE event_type IN ('turn_eager_end', 'asr_result', 'llm_response')
+            WHERE event_type IN ('turn_eager_end', 'asr_result', 'first_audio', 'speculative_resolution')
+              AND timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
             ORDER BY id ASC
             """,
+            args.hours,
         )
         call_rows = await fetch_rows(
             conn,
             """
             SELECT call_id, resolved, handoff_reason, duration_seconds, verified, turn_count
             FROM calls
+            WHERE started_at >= NOW() - make_interval(hours => $1::int)
             ORDER BY started_at DESC
             """,
+            args.hours,
         )
     finally:
         await conn.close()
 
-    sessions = build_session_events(log_rows)
-    perceived_latency_ms, llm_response_ms, speculative_hits, speculative_total = analyze_sessions(sessions)
+    turns = build_turn_metrics(log_rows)
+    eager_end_to_first_audio_ms, turn_end_to_first_audio_ms, speculative_hits, speculative_total = analyze_turns(turns)
 
-    perceived_p50 = percentile(perceived_latency_ms, 0.50)
-    perceived_p75 = percentile(perceived_latency_ms, 0.75)
-    perceived_p95 = percentile(perceived_latency_ms, 0.95)
-    llm_p50 = percentile(llm_response_ms, 0.50)
-    llm_p95 = percentile(llm_response_ms, 0.95)
+    eager_p50 = percentile(eager_end_to_first_audio_ms, 0.50)
+    eager_p75 = percentile(eager_end_to_first_audio_ms, 0.75)
+    eager_p95 = percentile(eager_end_to_first_audio_ms, 0.95)
+    turn_end_p50 = percentile(turn_end_to_first_audio_ms, 0.50)
+    turn_end_p75 = percentile(turn_end_to_first_audio_ms, 0.75)
+    turn_end_p95 = percentile(turn_end_to_first_audio_ms, 0.95)
     speculative_hit_rate = (speculative_hits / speculative_total * 100) if speculative_total else None
 
     total_calls = len(call_rows)
@@ -147,14 +150,17 @@ async def main() -> None:
     print("Latency Report")
     print("==============")
     print()
-    print("1. Perceived Latency")
-    print(f"p50: {fmt_ms(perceived_p50)}")
-    print(f"p75: {fmt_ms(perceived_p75)}")
-    print(f"p95: {fmt_ms(perceived_p95)}")
+    print(f"Lookback window: last {args.hours} hour(s)")
     print()
-    print("2. LLM Response Time")
-    print(f"p50: {fmt_ms(llm_p50)}")
-    print(f"p95: {fmt_ms(llm_p95)}")
+    print("1. Eager End To First Audio")
+    print(f"p50: {fmt_ms(eager_p50)}")
+    print(f"p75: {fmt_ms(eager_p75)}")
+    print(f"p95: {fmt_ms(eager_p95)}")
+    print()
+    print("2. Turn End To First Audio")
+    print(f"p50: {fmt_ms(turn_end_p50)}")
+    print(f"p75: {fmt_ms(turn_end_p75)}")
+    print(f"p95: {fmt_ms(turn_end_p95)}")
     print()
     print("3. Speculative Execution")
     print(f"Hit rate: {fmt_pct(speculative_hit_rate)}")
@@ -169,8 +175,11 @@ async def main() -> None:
     print("--------")
 
     has_warning = False
-    if perceived_p95 is not None and perceived_p95 > 500:
-        print(f"WARNING: perceived latency p95 is high at {fmt_ms(perceived_p95)}")
+    if eager_p50 is not None and eager_p50 > 3000:
+        print(f"WARNING: eager-end p50 is high at {fmt_ms(eager_p50)}; rerun with --hours 2 to isolate recent calls.")
+        has_warning = True
+    if turn_end_p50 is not None and turn_end_p50 > 3000:
+        print(f"WARNING: turn-end p50 is high at {fmt_ms(turn_end_p50)}; rerun with --hours 2 to isolate recent calls.")
         has_warning = True
     if speculative_hit_rate is not None and speculative_hit_rate < 80:
         print(f"WARNING: speculative hit rate is low at {fmt_pct(speculative_hit_rate)}")
