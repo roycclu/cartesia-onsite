@@ -1,28 +1,14 @@
 from __future__ import annotations
 
-import re
 import logging
+import re
 from typing import Any
 
 from app.compliance import log_event, utc_now_iso
+from app.tools.extractors import NUMBER_WORDS, normalize_policy_number
 from mock_data.db import execute, fetch_all, fetch_one
 
 logger = logging.getLogger("voice_agent")
-
-NUMBER_WORDS = {
-    "zero": "0",
-    "oh": "0",
-    "o": "0",
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
-}
 
 
 def _spoken_digits_to_string(text: str) -> str:
@@ -34,36 +20,6 @@ def _spoken_digits_to_string(text: str) -> str:
         elif token.isdigit():
             digits.append(token)
     return "".join(digits)
-
-
-def normalize_policy_number(value: str) -> str:
-    cleaned = value.lower().replace("-", " ").replace(".", " ")
-    tokens = re.findall(r"[a-z0-9]+", cleaned)
-    normalized: list[str] = []
-    for token in tokens:
-        if token in NUMBER_WORDS:
-            normalized.append(NUMBER_WORDS[token])
-            continue
-        if token == "policy":
-            continue
-        if token == "number":
-            continue
-        if token == "pol":
-            normalized.append("POL")
-            continue
-        if all(part in NUMBER_WORDS for part in token.split()):
-            normalized.extend(NUMBER_WORDS[part] for part in token.split())
-            continue
-        normalized.append(token.upper())
-    collapsed = "".join(normalized)
-    if not collapsed:
-        return ""
-    digits = "".join(char for char in collapsed if char.isdigit())
-    if collapsed.startswith("POL"):
-        return f"POL{digits}" if digits else "POL"
-    if digits:
-        return f"POL{digits}"
-    return collapsed
 
 
 def normalize_ssn_last4(value: str) -> str:

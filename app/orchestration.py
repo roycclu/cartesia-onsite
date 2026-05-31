@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -26,16 +25,11 @@ from app.prompts import (
     VERIFICATION_SUCCESS_WITH_PENDING,
     WRITE_REQUEST_PROMPT,
 )
-from app.tools import get_claim_status, get_policy_info, normalize_policy_number, trigger_handoff, verify_identity
+from app.tools.extractors import extract_fields
+from app.tools.insurance import get_claim_status, get_policy_info, trigger_handoff, verify_identity
+from app.tools.text_utils import emit_sentences, split_complete_sentences
 
 logger = logging.getLogger("voice_agent")
-
-SSN_PATTERN = re.compile(r"\b(\d{4})\b")
-POLICY_PATTERN = re.compile(r"\b([A-Z]{2,4}\d?)[-\s]?([0-9OoIi]{3,4})\b", re.IGNORECASE)
-SSN_CONTEXT_PATTERN = re.compile(
-    r"(?:ssn|social security number|last four(?: digits)?)\D*(\d{4})",
-    re.IGNORECASE,
-)
 
 ALLOWED_INTENTS = {
     "get_claim_status",
@@ -190,7 +184,7 @@ class LLMHelper:
 
         if call_state.should_handoff or state.get("intent") == "end_conversation" or state.get("repeated_query"):
             text = self._fallback_response(state)
-            await _emit_sentences(text, sentence_handler)
+            await emit_sentences(text, sentence_handler)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
             return text
 
@@ -212,7 +206,7 @@ class LLMHelper:
                         continue
                     parts.append(delta)
                     sentence_buffer += delta
-                    sentences, sentence_buffer = _split_complete_sentences(sentence_buffer)
+                    sentences, sentence_buffer = split_complete_sentences(sentence_buffer)
                     for sentence in sentences:
                         await sentence_handler(sentence)
                 if sentence_buffer.strip():
@@ -224,7 +218,7 @@ class LLMHelper:
         except Exception as exc:
             state["llm_error"] = str(exc)
             text = self._fallback_response(state)
-            await _emit_sentences(text, sentence_handler)
+            await emit_sentences(text, sentence_handler)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
             return text
 
@@ -504,56 +498,3 @@ class InsuranceOrchestrator:
             {"text": state["response_text"], "handoff": state["call_state"].should_handoff},
         )
         return state
-
-
-def extract_fields(transcript: str) -> dict[str, str | None]:
-    lower = transcript.lower()
-    split_at = len(transcript)
-    for kw in ("social", "ssn", "last four"):
-        idx = lower.find(kw)
-        if idx != -1:
-            split_at = min(split_at, idx)
-    policy_section = transcript[:split_at]
-    policy_section_clean = re.sub(r"(?<=[A-Za-z0-9])-(?=[A-Za-z0-9])", "", policy_section)
-
-    policy_number = None
-    policy_match = POLICY_PATTERN.search(policy_section_clean)
-    if policy_match:
-        prefix = policy_match.group(1).upper()
-        digits = policy_match.group(2).upper().replace("O", "0").replace("I", "1")
-        policy_number = normalize_policy_number(f"{prefix}{digits}")
-
-    ssn_match = SSN_CONTEXT_PATTERN.search(transcript)
-    if ssn_match:
-        ssn_last4 = ssn_match.group(1)
-    elif any(kw in lower for kw in ("ssn", "last four", "social")):
-        fallback_matches = SSN_PATTERN.findall(transcript)
-        ssn_last4 = fallback_matches[-1] if fallback_matches else None
-    else:
-        ssn_last4 = None
-
-    return {"policy_number": policy_number, "ssn_last4": ssn_last4}
-
-
-def predict_intent_fast(partial: str) -> str | None:
-    lower = partial.lower()
-    if any(word in lower for word in ("claim", "claims", "status")):
-        return "get_claim_status"
-    if any(word in lower for word in ("policy", "coverage", "deductible")):
-        return "get_policy_info"
-    return None
-
-
-def _split_complete_sentences(buffer: str) -> tuple[list[str], str]:
-    matches = list(re.finditer(r"[^.!?]*[.!?]", buffer))
-    if not matches:
-        return [], buffer
-    sentences = [match.group(0).strip() for match in matches]
-    remainder = buffer[matches[-1].end() :]
-    return [sentence for sentence in sentences if sentence], remainder
-
-
-async def _emit_sentences(text: str, sentence_handler: Callable[[str], Awaitable[None]]) -> None:
-    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
-        if sentence:
-            await sentence_handler(sentence)
