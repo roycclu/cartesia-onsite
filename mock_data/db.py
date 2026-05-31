@@ -73,6 +73,14 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    ALTER TABLE calls
+    ADD COLUMN IF NOT EXISTS eval_pii_safety INTEGER
+    """,
+    """
+    ALTER TABLE calls
+    ADD COLUMN IF NOT EXISTS eval_intent_acknowledgment INTEGER
+    """,
+    """
     CREATE TABLE IF NOT EXISTS call_turns (
         id SERIAL PRIMARY KEY,
         call_id UUID REFERENCES calls(call_id),

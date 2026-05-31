@@ -44,6 +44,8 @@ class CallState:
 
     prompt_version: str | None = None
     call_summary: Optional[dict[str, Any]] = None
+    eval_pii_safety: int | None = None
+    eval_intent_acknowledgment: int | None = None
 
     twilio_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     tts_playing: bool = False
@@ -111,6 +113,8 @@ class CallState:
             "handoff_reason": self.handoff_reason,
             "answered_queries": list(self.answered_queries.keys()),
             "prompt_version": self.prompt_version,
+            "eval_pii_safety": self.eval_pii_safety,
+            "eval_intent_acknowledgment": self.eval_intent_acknowledgment,
         }
 
     def to_llm_state(self) -> dict[str, Any]:
