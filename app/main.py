@@ -291,9 +291,10 @@ async def demo_text_turn(request: TextTurnRequest) -> dict[str, Any]:
     session.prompt_version = PROMPT_VERSION
     sessions[session_id] = session
     result = await process_transcript(session, request.transcript)
+    response_text = result.get("response_text") or result.get("response") or ""
     return {
         "session_id": session_id,
-        "response_text": result["response_text"],
+        "response_text": response_text,
         "verified": session.verified,
         "should_handoff": session.should_handoff,
         "handoff_reason": session.handoff_reason,
@@ -371,11 +372,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
                 await log_event(session.session_id, "twilio_stream_start", event)
                 schedule_response_task(
                     session,
-                    send_twilio_response(
-                        websocket,
-                        session,
-                        GREETING_PROMPT,
-                    ),
+                    send_opening_greeting(websocket, session),
                 )
                 continue
 
@@ -438,7 +435,9 @@ async def handle_websocket_event(websocket: WebSocket, session: CallState, event
         return
     if event_type == "custom" and event.get("metadata", {}).get("transcript"):
         result = await process_transcript(session, event["metadata"]["transcript"])
-        await send_agent_response(websocket, session, result["response_text"])
+        response_text = result.get("response_text") or result.get("response") or ""
+        if response_text:
+            await send_agent_response(websocket, session, response_text)
         return
     if event_type == "dtmf":
         await log_event(session.session_id, "dtmf", event)
@@ -479,7 +478,9 @@ async def process_transcript(session: CallState, transcript: str) -> GraphState:
         state["sentence_handler"] = build_sentence_handler(session)
     result = await get_orchestrator().run_turn(state)
     session.add_turn("user", transcript)
-    session.add_turn("assistant", result["response_text"])
+    response_text = result.get("response_text") or result.get("response") or ""
+    if response_text:
+        session.add_turn("assistant", response_text)
     return result
 
 
@@ -504,6 +505,11 @@ async def send_agent_response(
                 "text": text,
             }
         )
+
+
+async def send_opening_greeting(websocket: WebSocket, session: CallState) -> None:
+    greeting = await get_orchestrator().generate_greeting()
+    await send_twilio_response(websocket, session, greeting)
 
 
 async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: str, transport: str = "cartesia") -> None:
@@ -557,16 +563,23 @@ async def send_twilio_response(
         first_audio_logged = False
         mulaw_buffer = bytearray()
         try:
-            async for chunk in get_tts().stream_synthesize(session.session_id, text):
-                pcm_chunk = base64.b64decode(chunk)
-                mulaw_buffer.extend(audioop.lin2ulaw(pcm_chunk, 2))
-                first_audio_logged = await send_audio_to_twilio(
-                    websocket,
-                    session,
-                    bytes_buffer=mulaw_buffer,
-                    first_audio_logged=first_audio_logged,
-                    latency_t0=latency_t0,
-                )
+            try:
+                async for chunk in get_tts().stream_synthesize(session.session_id, text):
+                    pcm_chunk = base64.b64decode(chunk)
+                    mulaw_buffer.extend(audioop.lin2ulaw(pcm_chunk, 2))
+                    first_audio_logged = await send_audio_to_twilio(
+                        websocket,
+                        session,
+                        bytes_buffer=mulaw_buffer,
+                        first_audio_logged=first_audio_logged,
+                        latency_t0=latency_t0,
+                    )
+            except Exception as exc:
+                if "402" in str(exc) or "quota" in str(exc).lower():
+                    logger.error("TTS_QUOTA_EXCEEDED [%s]", session.session_id)
+                    await handle_tts_unavailable(websocket, session)
+                    return
+                raise
             if mulaw_buffer:
                 padded_frame = bytes(mulaw_buffer[:TWILIO_FRAME_SIZE]).ljust(TWILIO_FRAME_SIZE, b"\xff")
                 if session.interrupted or session.response_buffer.superseded:
@@ -602,20 +615,37 @@ async def handle_completed_turn(
     *,
     speculative: bool,
 ) -> None:
-    session.interrupted = False
-    session.response_buffer.start()
-    session.current_latency_t0 = latency_t0
-    result = await process_transcript(session, transcript)
-    logger.info("LATENCY [%s] llm_response_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
-    if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0:
-        await send_agent_response(websocket, session, result["response_text"], transport="twilio", latency_t0=latency_t0)
-    session.pending_transcript = None
-    if speculative:
-        session.speculative_transcript = transcript
-        session.speculative_task = asyncio.current_task()
-    if session.should_close:
-        await finalize_call(session, resolved=session.resolved)
-        await websocket.close(code=1000)
+    try:
+        session.interrupted = False
+        session.response_buffer.start()
+        session.current_latency_t0 = latency_t0
+        result = await process_transcript(session, transcript)
+        logger.info("LATENCY [%s] llm_response_ms=%s", session.session_id, int((time.time() - latency_t0) * 1000))
+        response_text = result.get("response_text") or result.get("response") or ""
+        if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0 and response_text:
+            await send_agent_response(websocket, session, response_text, transport="twilio", latency_t0=latency_t0)
+        session.pending_transcript = None
+        if speculative:
+            session.speculative_transcript = transcript
+            session.speculative_task = asyncio.current_task()
+        if session.should_close:
+            await finalize_call(session, resolved=session.resolved)
+            await websocket.close(code=1000)
+    except Exception as exc:
+        logger.error("TURN_ERROR [%s] %s", session.session_id, exc)
+        await fail_safe_handoff(websocket, session, "system_error", transport="twilio")
+
+
+async def handle_tts_unavailable(websocket: WebSocket, session: CallState) -> None:
+    await trigger_handoff(session.session_id, "tts_unavailable", "TTS unavailable")
+    session.should_handoff = True
+    session.handoff_reason = "tts_unavailable"
+    session.tts_playing = False
+    await send_clear_to_twilio(websocket, session)
+    try:
+        await websocket.close(code=1011)
+    except RuntimeError:
+        logger.info("tts_unavailable_socket_closed session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
 
 
 def schedule_response_task(session: CallState, coroutine: Any) -> None:

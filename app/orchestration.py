@@ -13,6 +13,7 @@ from app.call_state import CallState
 from app.compliance import log_event
 from app.prompts import (
     END_CONVERSATION_PROMPT,
+    GREETING_PROMPT,
     INTENT_CLASSIFICATION_PROMPT,
     LLM_ERROR_PROMPT,
     LLM_RESPONSE_PROMPT,
@@ -20,7 +21,7 @@ from app.prompts import (
     PROMPT_VERSION,
     REPEATED_QUERY_INSTRUCTION,
     VERIFICATION_FAILED_HANDOFF_PROMPT,
-    VERIFICATION_REQUIRED_PROMPT,
+    VERIFICATION_PROMPT,
     VERIFICATION_SUCCESS_PROMPT,
     VERIFICATION_SUCCESS_WITH_PENDING,
     WRITE_REQUEST_PROMPT,
@@ -100,6 +101,41 @@ class LLMHelper:
             return text if text in ALLOWED_INTENTS else "unknown"
         except Exception:
             return "unknown"
+
+    async def generate_greeting(self) -> str:
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                response = await self.client.responses.create(model=self.model, input=GREETING_PROMPT)
+            text = (response.output_text or "").strip()
+            return text or self._fallback_greeting()
+        except Exception:
+            return self._fallback_greeting()
+
+    async def generate_verification_prompt(self, attempts: int) -> str:
+        prompt = VERIFICATION_PROMPT.format(attempts=attempts)
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                response = await self.client.responses.create(model=self.model, input=prompt)
+            text = (response.output_text or "").strip()
+            return text or self._fallback_verification_prompt(attempts)
+        except Exception:
+            return self._fallback_verification_prompt(attempts)
+
+    async def generate_verification_success(self, holder_name: str | None, pending_intent: str | None = None) -> str:
+        if pending_intent:
+            prompt = VERIFICATION_SUCCESS_WITH_PENDING.format(
+                holder_name=holder_name or "the caller",
+                pending_intent=pending_intent.replace("_", " "),
+            )
+        else:
+            prompt = VERIFICATION_SUCCESS_PROMPT.format(holder_name=holder_name or "the caller")
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                response = await self.client.responses.create(model=self.model, input=prompt)
+            text = (response.output_text or "").strip()
+            return text or self._fallback_verification_success(holder_name, pending_intent)
+        except Exception:
+            return self._fallback_verification_success(holder_name, pending_intent)
 
     async def generate_response(self, state: GraphState) -> str:
         call_state = state["call_state"]
@@ -195,8 +231,24 @@ class LLMHelper:
                 f"and a deductible of {result['deductible']} dollars."
             )
         if call_state.verified:
-            return VERIFICATION_SUCCESS_PROMPT
-        return VERIFICATION_REQUIRED_PROMPT
+            return self._fallback_verification_success(None, None)
+        return self._fallback_verification_prompt(call_state.verification_attempts)
+
+    def _fallback_verification_prompt(self, attempts: int) -> str:
+        if attempts <= 0:
+            return "Welcome in. I just need your policy number and the last four of your Social Security number."
+        if attempts == 1:
+            return "I didn't catch that. Please share your policy number and the last four of your Social Security number."
+        return "Sorry for the confusion. One more time: your policy number and last four of your Social Security number, or I'll transfer you."
+
+    def _fallback_verification_success(self, holder_name: str | None, pending_intent: str | None) -> str:
+        first_name = (holder_name or "there").split()[0]
+        if pending_intent:
+            return f"Great, I've got you verified {first_name} — I can help with your {pending_intent.replace('_', ' ')}."
+        return f"Great, I've got you verified {first_name} — what can I help you with today?"
+
+    def _fallback_greeting(self) -> str:
+        return "Thanks for calling Acme Insurance, how can I help you today?"
 
 
 class InsuranceOrchestrator:
@@ -224,6 +276,9 @@ class InsuranceOrchestrator:
         result = await self.graph.ainvoke(state)
         await log_event(result["session_id"], "graph_result", {"prompt_version": PROMPT_VERSION, "state": result["call_state"].to_llm_state()})
         return result
+
+    async def generate_greeting(self) -> str:
+        return await self.llm.generate_greeting()
 
     async def _extract_fields_node(self, state: GraphState) -> GraphState:
         call_state = state["call_state"]
@@ -263,8 +318,17 @@ class InsuranceOrchestrator:
         )
 
         if not policy_number or not ssn_last4:
-            state["tool_result"] = {"verified": False, "message": VERIFICATION_REQUIRED_PROMPT}
-            state["response_text"] = VERIFICATION_REQUIRED_PROMPT
+            if call_state.verification_attempts >= 3:
+                call_state.should_handoff = True
+                call_state.handoff_reason = "verification_failed"
+                state["should_handoff"] = True
+                state["handoff_reason"] = "verification_failed"
+                state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", state["transcript"])
+                state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
+                return state
+            state["tool_result"] = {"verified": False}
+            state["response_text"] = await self.llm.generate_verification_prompt(call_state.verification_attempts)
+            call_state.verification_attempts += 1
             return state
 
         logger.info("VERIFY_CALL [%s] calling verify_identity with policy=%r ssn=%r", state["session_id"], policy_number, ssn_last4)
@@ -282,16 +346,12 @@ class InsuranceOrchestrator:
         if verification["verified"]:
             call_state.verified = True
             call_state.verification_attempts = 0
-            if call_state.pending_intent:
-                state["response_text"] = VERIFICATION_SUCCESS_WITH_PENDING.format(
-                    pending_intent=call_state.pending_intent.replace("_", " ")
-                )
-                call_state.pending_intent = None
-            else:
-                state["response_text"] = VERIFICATION_SUCCESS_PROMPT
+            holder_name = verification.get("holder_name")
+            pending_intent = call_state.pending_intent
+            state["response_text"] = await self.llm.generate_verification_success(holder_name, pending_intent)
+            call_state.pending_intent = None
             return state
 
-        call_state.verification_attempts += 1
         if call_state.verification_attempts >= 3:
             call_state.should_handoff = True
             call_state.handoff_reason = "verification_failed"
@@ -301,7 +361,8 @@ class InsuranceOrchestrator:
             state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
             return state
 
-        state["response_text"] = VERIFICATION_REQUIRED_PROMPT
+        state["response_text"] = await self.llm.generate_verification_prompt(call_state.verification_attempts)
+        call_state.verification_attempts += 1
         return state
 
     def _route_after_verification(self, state: GraphState) -> str:
@@ -367,7 +428,7 @@ class InsuranceOrchestrator:
             call_state.record_answered_query(intent, result)
             state["tool_result"] = result
         else:
-            state["tool_result"] = {"message": VERIFICATION_SUCCESS_PROMPT}
+            state["tool_result"] = {"message": "verified"}
         return state
 
     async def _generate_response(self, state: GraphState) -> GraphState:
