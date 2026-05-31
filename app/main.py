@@ -49,6 +49,11 @@ logger = logging.getLogger("voice_agent")
 app = FastAPI(title="Insurance Voice Agent Demo", version="0.1.0")
 
 
+def should_process_transcript(transcript: str) -> bool:
+    cleaned = transcript.strip().strip(".,!?")
+    return len(cleaned) >= 3
+
+
 class InkTurnStream:
     def __init__(self, websocket: Any, listener_task: asyncio.Task[None]) -> None:
         self.websocket = websocket
@@ -137,7 +142,7 @@ class CartesiaTranscriber:
                 if event_type == "turn.eager_end":
                     await log_event(session.session_id, "turn_eager_end", message)
                     transcript = (message.get("transcript") or "").strip()
-                    if transcript:
+                    if transcript and should_process_transcript(transcript):
                         t0 = time.time()
                         session.pending_transcript = transcript
                         start_speculative_task(session, twilio_ws, transcript, t0)
@@ -146,7 +151,7 @@ class CartesiaTranscriber:
                     transcript = (message.get("transcript") or "").strip()
                     logger.info("TURN [%s] USER: %s", session.session_id, transcript)
                     await log_event(session.session_id, "asr_result", {"text": transcript, "provider": "cartesia_ink_2"})
-                    if transcript:
+                    if transcript and should_process_transcript(transcript):
                         if await resolve_speculative_turn(session, twilio_ws, transcript):
                             continue
                         session.pending_transcript = transcript
@@ -154,6 +159,8 @@ class CartesiaTranscriber:
                             session,
                             handle_completed_turn(session, twilio_ws, transcript, time.time(), speculative=False),
                         )
+                    elif transcript:
+                        logger.info("SKIP_NOISE_TURN [%s] transcript=%r", session.session_id, transcript)
                     continue
                 if event_type == "error":
                     raise RuntimeError(message.get("message", "Cartesia Ink-2 error"))
@@ -616,6 +623,9 @@ async def handle_completed_turn(
     speculative: bool,
 ) -> None:
     try:
+        if not should_process_transcript(transcript):
+            logger.info("SKIP_NOISE_TURN [%s] transcript=%r", session.session_id, transcript)
+            return
         session.interrupted = False
         session.response_buffer.start()
         session.current_latency_t0 = latency_t0

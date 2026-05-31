@@ -120,8 +120,11 @@ class LLMHelper:
         except Exception:
             return self._fallback_greeting()
 
-    async def generate_verification_prompt(self, attempts: int) -> str:
-        prompt = VERIFICATION_PROMPT.format(attempts=attempts)
+    async def generate_verification_prompt(self, attempts: int, recent_history: list[dict[str, str]] | None = None) -> str:
+        prompt = VERIFICATION_PROMPT.format(
+            attempts=attempts,
+            recent_history=recent_history or [],
+        )
         try:
             params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
             self._validate_llm_params(params, "generate_verification_prompt")
@@ -349,7 +352,10 @@ class InsuranceOrchestrator:
                 state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
                 return state
             state["tool_result"] = {"verified": False}
-            state["response_text"] = await self.llm.generate_verification_prompt(call_state.verification_attempts)
+            state["response_text"] = await self.llm.generate_verification_prompt(
+                call_state.verification_attempts,
+                call_state.history[-4:],
+            )
             call_state.verification_attempts += 1
             return state
 
@@ -370,6 +376,7 @@ class InsuranceOrchestrator:
             call_state.holder_name = verification.get("holder_name")
             call_state.latest_tool_result = verification
             call_state.verification_attempts = 0
+            call_state.last_verification_failed = False
             holder_name = verification.get("holder_name")
             pending_intent = call_state.pending_intent
             if pending_intent:
@@ -395,8 +402,11 @@ class InsuranceOrchestrator:
             state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
             return state
 
-        state["response_text"] = await self.llm.generate_verification_prompt(call_state.verification_attempts)
-        call_state.verification_attempts += 1
+        call_state.mark_verification_failed()
+        state["response_text"] = await self.llm.generate_verification_prompt(
+            call_state.verification_attempts,
+            call_state.history[-4:],
+        )
         return state
 
     def _route_after_verification(self, state: GraphState) -> str:

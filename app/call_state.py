@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 import uuid
 
 from app.response_buffer import ResponseBuffer
+
+logger = logging.getLogger("voice_agent")
 
 
 @dataclass
@@ -22,6 +25,7 @@ class CallState:
     verified: bool = False
     policy_number: Optional[str] = None
     ssn_last4: Optional[str] = None
+    last_verification_failed: bool = False
     holder_name: Optional[str] = None
     verification_attempts: int = 0
 
@@ -60,8 +64,14 @@ class CallState:
     def merge_extracted_fields(self, extracted: dict[str, Any]) -> None:
         if extracted.get("policy_number") and not self.policy_number:
             self.policy_number = extracted["policy_number"]
-        if extracted.get("ssn_last4") and not self.ssn_last4:
-            self.ssn_last4 = extracted["ssn_last4"]
+        new_ssn = extracted.get("ssn_last4")
+        if new_ssn:
+            if not self.ssn_last4:
+                self.ssn_last4 = new_ssn
+            elif self.last_verification_failed:
+                self.ssn_last4 = new_ssn
+                self.last_verification_failed = False
+                logger.info("SSN_UPDATED replacing failed SSN with new value")
 
     def capture_pending_intent(self, intent: str, transcript: str) -> None:
         if not self.verified and intent not in ("verify_identity", "unknown"):
@@ -71,6 +81,11 @@ class CallState:
     def record_answered_query(self, query_type: str, result: dict[str, Any]) -> None:
         self.answered_queries[query_type] = result
         self.latest_tool_result = result
+
+    def mark_verification_failed(self) -> None:
+        self.last_verification_failed = True
+        self.ssn_last4 = None
+        self.verification_attempts += 1
 
     def already_answered(self, query_type: str) -> bool:
         return query_type in self.answered_queries
@@ -107,6 +122,7 @@ class CallState:
             "pending_intent": self.pending_intent,
             "answered_queries": self.answered_queries,
             "latest_tool_result": self.latest_tool_result,
+            "recent_history": self.history[-4:] if self.history else [],
             "should_handoff": self.should_handoff,
             "handoff_reason": self.handoff_reason,
         }
