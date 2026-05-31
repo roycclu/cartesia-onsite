@@ -478,9 +478,16 @@ async def process_transcript(session: SessionContext, transcript: str) -> GraphS
     return result
 
 
-async def send_agent_response(websocket: WebSocket, session: SessionContext, text: str, transport: str = "cartesia") -> None:
+async def send_agent_response(
+    websocket: WebSocket,
+    session: SessionContext,
+    text: str,
+    transport: str = "cartesia",
+    *,
+    latency_t0: float | None = None,
+) -> None:
     if transport == "twilio":
-        await send_twilio_response(websocket, session, text)
+        await send_twilio_response(websocket, session, text, latency_t0=latency_t0)
         return
     audio_chunks = await get_tts().synthesize(session.session_id, text)
     for chunk in audio_chunks:
@@ -592,11 +599,13 @@ async def handle_completed_turn(
             await filler_task
         except asyncio.CancelledError:
             return
-    await send_agent_response(websocket, session, result["response_text"], transport="twilio")
+    await send_agent_response(websocket, session, result["response_text"], transport="twilio", latency_t0=latency_t0)
     session.pending_transcript = None
 
 
 def schedule_response_task(session: SessionContext, coroutine: Any) -> None:
+    if session.active_response_task is not None and not session.active_response_task.done():
+        session.active_response_task.cancel()
     task = asyncio.create_task(coroutine)
     session.active_response_task = task
 
