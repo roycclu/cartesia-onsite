@@ -16,10 +16,10 @@ from app.prompts import (
     GREETING_PROMPT,
     INTENT_CLASSIFICATION_PROMPT,
     LLM_ERROR_PROMPT,
-    LLM_RESPONSE_PROMPT,
     OUT_OF_SCOPE_PROMPT,
     PROMPT_VERSION,
     REPEATED_QUERY_INSTRUCTION,
+    SYSTEM_PROMPT_VERIFIED,
     VERIFICATION_FAILED_HANDOFF_PROMPT,
     VERIFICATION_PROMPT,
     VERIFICATION_SUCCESS_PROMPT,
@@ -78,6 +78,11 @@ class LLMHelper:
         self.model = config.OPENAI_MODEL
         self.timeout_seconds = float(config.LLM_TIMEOUT_SECONDS)
         self.client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        self.max_tokens = 80
+
+    def _validate_llm_params(self, params: dict[str, Any], caller: str) -> None:
+        if "max_tokens" not in params and "max_output_tokens" not in params:
+            logger.warning("LLM_MISSING_MAX_TOKENS caller=%s", caller)
 
     async def classify_intent(self, transcript: str) -> Intent:
         lowered = transcript.lower()
@@ -95,8 +100,10 @@ class LLMHelper:
             return "get_policy_info"
         prompt = INTENT_CLASSIFICATION_PROMPT.format(transcript=transcript)
         try:
+            params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
+            self._validate_llm_params(params, "classify_intent")
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.client.responses.create(model=self.model, input=prompt)
+                response = await self.client.responses.create(**params)
             text = (response.output_text or "unknown").strip().split()[0]
             return text if text in ALLOWED_INTENTS else "unknown"
         except Exception:
@@ -104,8 +111,10 @@ class LLMHelper:
 
     async def generate_greeting(self) -> str:
         try:
+            params = {"model": self.model, "input": GREETING_PROMPT, "max_output_tokens": self.max_tokens}
+            self._validate_llm_params(params, "generate_greeting")
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.client.responses.create(model=self.model, input=GREETING_PROMPT)
+                response = await self.client.responses.create(**params)
             text = (response.output_text or "").strip()
             return text or self._fallback_greeting()
         except Exception:
@@ -114,8 +123,10 @@ class LLMHelper:
     async def generate_verification_prompt(self, attempts: int) -> str:
         prompt = VERIFICATION_PROMPT.format(attempts=attempts)
         try:
+            params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
+            self._validate_llm_params(params, "generate_verification_prompt")
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.client.responses.create(model=self.model, input=prompt)
+                response = await self.client.responses.create(**params)
             text = (response.output_text or "").strip()
             return text or self._fallback_verification_prompt(attempts)
         except Exception:
@@ -130,8 +141,10 @@ class LLMHelper:
         else:
             prompt = VERIFICATION_SUCCESS_PROMPT.format(holder_name=holder_name or "the caller")
         try:
+            params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
+            self._validate_llm_params(params, "generate_verification_success")
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.client.responses.create(model=self.model, input=prompt)
+                response = await self.client.responses.create(**params)
             text = (response.output_text or "").strip()
             return text or self._fallback_verification_success(holder_name, pending_intent)
         except Exception:
@@ -140,14 +153,18 @@ class LLMHelper:
     async def generate_response(self, state: GraphState) -> str:
         call_state = state["call_state"]
         repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
-        prompt = LLM_RESPONSE_PROMPT.format(
+        prompt = SYSTEM_PROMPT_VERIFIED.format(
+            holder_name=(call_state.holder_name or "there").split()[0],
+            latest_tool_result=call_state.latest_tool_result or state.get("tool_result") or {},
             repeated_query_instruction=repeated_instruction,
             state=call_state.to_llm_state(),
         )
         logger.info("TURN [%s] PROMPT: %s", state["session_id"], prompt)
         try:
+            params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
+            self._validate_llm_params(params, "generate_response")
             async with asyncio.timeout(self.timeout_seconds):
-                response = await self.client.responses.create(model=self.model, input=prompt)
+                response = await self.client.responses.create(**params)
             text = (response.output_text or "").strip() or self._fallback_response(state)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
             return text
@@ -160,7 +177,9 @@ class LLMHelper:
     async def stream_response(self, state: GraphState, sentence_handler: Callable[[str], Awaitable[None]]) -> str:
         call_state = state["call_state"]
         repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
-        prompt = LLM_RESPONSE_PROMPT.format(
+        prompt = SYSTEM_PROMPT_VERIFIED.format(
+            holder_name=(call_state.holder_name or "there").split()[0],
+            latest_tool_result=call_state.latest_tool_result or state.get("tool_result") or {},
             repeated_query_instruction=repeated_instruction,
             state=call_state.to_llm_state(),
         )
@@ -173,12 +192,15 @@ class LLMHelper:
             return text
 
         try:
+            params = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+                "max_tokens": self.max_tokens,
+            }
+            self._validate_llm_params(params, "stream_response")
             async with asyncio.timeout(self.timeout_seconds):
-                stream = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True,
-                )
+                stream = await self.client.chat.completions.create(**params)
                 parts: list[str] = []
                 sentence_buffer = ""
                 async for chunk in stream:
@@ -345,11 +367,22 @@ class InsuranceOrchestrator:
 
         if verification["verified"]:
             call_state.verified = True
+            call_state.holder_name = verification.get("holder_name")
+            call_state.latest_tool_result = verification
             call_state.verification_attempts = 0
             holder_name = verification.get("holder_name")
             pending_intent = call_state.pending_intent
-            state["response_text"] = await self.llm.generate_verification_success(holder_name, pending_intent)
-            call_state.pending_intent = None
+            if pending_intent:
+                intent = pending_intent
+                transcript = call_state.pending_intent_transcript or state["transcript"]
+                call_state.pending_intent = None
+                call_state.pending_intent_transcript = None
+                state["intent"] = intent
+                state["transcript"] = transcript
+                logger.info("PENDING_INTENT_RESOLVED [%s] intent=%s", state["session_id"], intent)
+                state = await self._execute_tools(state)
+                return await self._generate_response(state)
+            state["response_text"] = await self.llm.generate_verification_success(holder_name, None)
             return state
 
         if call_state.verification_attempts >= 3:
@@ -358,6 +391,7 @@ class InsuranceOrchestrator:
             state["should_handoff"] = True
             state["handoff_reason"] = "verification_failed"
             state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", state["transcript"])
+            call_state.latest_tool_result = state["tool_result"]
             state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
             return state
 
@@ -374,7 +408,9 @@ class InsuranceOrchestrator:
         call_state = state["call_state"]
         intent = await self.llm.classify_intent(state["transcript"])
         state["intent"] = intent
-        call_state.capture_pending_intent(intent)
+        call_state.capture_pending_intent(intent, state["transcript"])
+        if call_state.pending_intent == intent and call_state.pending_intent_transcript == state["transcript"]:
+            logger.info("PENDING_INTENT captured: %s from: %s", intent, state["transcript"])
         await log_event(state["session_id"], "intent_classification", {"transcript": state["transcript"], "intent": intent})
         return state
 
@@ -395,6 +431,7 @@ class InsuranceOrchestrator:
             state["should_handoff"] = True
             state["handoff_reason"] = "human_requested"
             state["tool_result"] = await trigger_handoff(state["session_id"], "human_requested", transcript)
+            call_state.latest_tool_result = state["tool_result"]
             return state
 
         if intent in {"write_request", "out_of_scope"}:
@@ -403,11 +440,13 @@ class InsuranceOrchestrator:
             state["should_handoff"] = True
             state["handoff_reason"] = intent
             state["tool_result"] = await trigger_handoff(state["session_id"], intent, transcript)
+            call_state.latest_tool_result = state["tool_result"]
             return state
 
         if call_state.already_answered(intent):
             state["repeated_query"] = True
             state["tool_result"] = call_state.answered_queries[intent]
+            call_state.latest_tool_result = state["tool_result"]
             return state
 
         prefetched = call_state.prefetched_data.get(intent)

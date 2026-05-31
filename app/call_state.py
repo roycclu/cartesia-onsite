@@ -22,11 +22,14 @@ class CallState:
     verified: bool = False
     policy_number: Optional[str] = None
     ssn_last4: Optional[str] = None
+    holder_name: Optional[str] = None
     verification_attempts: int = 0
 
     history: list[dict[str, str]] = field(default_factory=list)
     pending_intent: Optional[str] = None
+    pending_intent_transcript: Optional[str] = None
     answered_queries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    latest_tool_result: dict[str, Any] | None = None
     turn_count: int = 0
     human_requests: int = 0
 
@@ -60,12 +63,14 @@ class CallState:
         if extracted.get("ssn_last4") and not self.ssn_last4:
             self.ssn_last4 = extracted["ssn_last4"]
 
-    def capture_pending_intent(self, intent: str) -> None:
+    def capture_pending_intent(self, intent: str, transcript: str) -> None:
         if not self.verified and intent not in ("verify_identity", "unknown"):
             self.pending_intent = intent
+            self.pending_intent_transcript = transcript
 
     def record_answered_query(self, query_type: str, result: dict[str, Any]) -> None:
         self.answered_queries[query_type] = result
+        self.latest_tool_result = result
 
     def already_answered(self, query_type: str) -> bool:
         return query_type in self.answered_queries
@@ -97,9 +102,11 @@ class CallState:
         return {
             "verified": self.verified,
             "policy_number": self.policy_number,
+            "holder_name": self.holder_name,
             "turn_count": self.turn_count,
             "pending_intent": self.pending_intent,
-            "answered_queries": list(self.answered_queries.keys()),
+            "answered_queries": self.answered_queries,
+            "latest_tool_result": self.latest_tool_result,
             "should_handoff": self.should_handoff,
             "handoff_reason": self.handoff_reason,
         }
