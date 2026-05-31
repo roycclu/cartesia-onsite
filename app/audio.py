@@ -14,6 +14,7 @@ import websockets
 from app import config
 from app.app_state import get_orchestrator, get_tts
 from app.call_state import CallState
+from app.compliance import log_event
 from app.prompts import HUMAN_HANDOFF_PROMPT
 from app.tools.insurance import trigger_handoff
 
