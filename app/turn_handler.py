@@ -11,7 +11,6 @@ from app.app_state import get_orchestrator, sessions
 from app.call_state import CallState
 from app.call_state_manager import call_state_manager
 from app.compliance import log_event, persist_call_record
-from app.extractors import predict_intent_fast
 from app.orchestration import GraphState
 from app.prompts import HUMAN_REQUESTED_TWICE_PROMPT
 from app.tools.extractors import predict_intent_fast
