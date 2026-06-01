@@ -151,9 +151,15 @@ class LLMHelper:
     async def generate_response(self, state: GraphState) -> str:
         call_state = state["call_state"]
         repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
+        name_instruction = (
+            "- The caller has already been acknowledged earlier in the call. Never greet them again or address them by first name.\n"
+            if call_state.name_acknowledged
+            else "- If you refer to the caller at all, avoid using their first name as a greeting.\n"
+        )
         prompt = SYSTEM_PROMPT_VERIFIED.format(
             holder_name=(call_state.holder_name or "there").split()[0],
             latest_tool_result=call_state.latest_tool_result or state.get("tool_result") or {},
+            name_instruction=name_instruction,
             repeated_query_instruction=repeated_instruction,
             state=call_state.to_llm_state(),
         )
@@ -175,9 +181,15 @@ class LLMHelper:
     async def stream_response(self, state: GraphState, sentence_handler: Callable[[str], Awaitable[None]]) -> str:
         call_state = state["call_state"]
         repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
+        name_instruction = (
+            "- The caller has already been acknowledged earlier in the call. Never greet them again or address them by first name.\n"
+            if call_state.name_acknowledged
+            else "- If you refer to the caller at all, avoid using their first name as a greeting.\n"
+        )
         prompt = SYSTEM_PROMPT_VERIFIED.format(
             holder_name=(call_state.holder_name or "there").split()[0],
             latest_tool_result=call_state.latest_tool_result or state.get("tool_result") or {},
+            name_instruction=name_instruction,
             repeated_query_instruction=repeated_instruction,
             state=call_state.to_llm_state(),
         )
@@ -218,6 +230,17 @@ class LLMHelper:
             return text
         except Exception as exc:
             state["llm_error"] = str(exc)
+            emitted_output = call_state.response_buffer.sentences_sent > 0
+            logger.exception(
+                "TURN_STREAM_ERROR [%s] emitted_output=%s error=%s",
+                state["session_id"],
+                emitted_output,
+                exc,
+            )
+            if emitted_output:
+                text = "".join(parts).strip() or sentence_buffer.strip()
+                logger.info("TURN [%s] LLM_PARTIAL: %s", state["session_id"], text)
+                return text
             text = self._fallback_response(state)
             await emit_sentences(text, sentence_handler)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
@@ -390,6 +413,7 @@ class InsuranceOrchestrator:
             should_emit_transition = not call_state.post_verification_greeted
             if should_emit_transition:
                 call_state.post_verification_greeted = True
+                call_state.name_acknowledged = True
             if pending_intent:
                 intent = pending_intent
                 transcript = call_state.pending_intent_transcript or state["transcript"]

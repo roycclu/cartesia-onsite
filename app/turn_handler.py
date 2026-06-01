@@ -104,7 +104,6 @@ async def cancel_session_tasks(session: CallState) -> None:
     session.last_mark = None
     session.interrupted = True
     session.response_buffer.supersede()
-    session.current_latency_t0 = None
     for task in tasks:
         if task is not None and not task.done():
             task.cancel()
@@ -153,11 +152,6 @@ async def resolve_speculative_turn(session: CallState, websocket: WebSocket, tra
     similarity = transcript_similarity(speculative_transcript, transcript)
     hit = similarity >= 0.80
     logger.info("SPECULATIVE [%s] similarity=%.2f outcome=%s", session.session_id, similarity, "hit" if hit else "miss")
-    await log_event(
-        session.session_id,
-        "speculative_resolution",
-        {"turn_id": session.current_turn_id, "similarity": round(similarity, 4), "outcome": "hit" if hit else "miss"},
-    )
     if hit:
         session.pending_transcript = None
         session.speculative_transcript = None
@@ -198,9 +192,7 @@ def build_sentence_handler(session: CallState):
             session,
             sentence,
             transport="twilio",
-            latency_t0=session.current_latency_t0,
         )
-        session.current_latency_t0 = None
         session.response_buffer.sentence_complete()
 
     return _handle_sentence
@@ -223,17 +215,10 @@ async def handle_completed_turn(
             return
         session.interrupted = False
         session.response_buffer.start()
-        session.current_latency_t0 = latency_t0
         result = await process_transcript(session, transcript)
-        logger.info(
-            "LATENCY [%s] turn_id=%s llm_response_ms=%s",
-            session.session_id,
-            session.current_turn_id,
-            int((time.time() - latency_t0) * 1000),
-        )
         response_text = result.get("response_text") or result.get("response") or ""
         if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0 and response_text:
-            await send_agent_response(websocket, session, response_text, transport="twilio", latency_t0=latency_t0)
+            await send_agent_response(websocket, session, response_text, transport="twilio")
         elif not response_text:
             await log_turn_outcome(session, "no_response_needed")
         session.pending_transcript = None

@@ -30,6 +30,7 @@ class CallState:
     holder_name: Optional[str] = None
     verification_attempts: int = 0
     post_verification_greeted: bool = False
+    name_acknowledged: bool = False
 
     history: list[dict[str, str]] = field(default_factory=list)
     pending_intent: Optional[str] = None
@@ -63,9 +64,7 @@ class CallState:
     response_buffer: ResponseBuffer = field(default_factory=ResponseBuffer, repr=False)
     interrupted: bool = False
     twilio_websocket: Any = field(default=None, repr=False)
-    current_latency_t0: float | None = None
     current_turn_id: str | None = None
-    current_eager_latency_t0: float | None = None
     current_turn_end_latency_t0: float | None = None
     current_turn_response_started_logged: bool = False
     current_turn_outcome: str | None = None
@@ -89,7 +88,6 @@ class CallState:
 
     def start_new_turn(self) -> str:
         self.current_turn_id = str(uuid.uuid4())[:8]
-        self.current_eager_latency_t0 = None
         self.current_turn_end_latency_t0 = None
         self.current_turn_response_started_logged = False
         self.current_turn_outcome = None
@@ -137,6 +135,7 @@ class CallState:
             "verified": self.verified,
             "policy_number": self.policy_number,
             "holder_name": self.holder_name,
+            "name_acknowledged": self.name_acknowledged,
             "turn_count": self.turn_count,
             "pending_intent": self.pending_intent,
             "answered_queries": self.answered_queries,

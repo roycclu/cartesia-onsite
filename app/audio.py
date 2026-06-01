@@ -72,11 +72,9 @@ async def send_agent_response(
     session: CallState,
     text: str,
     transport: str = "cartesia",
-    *,
-    latency_t0: float | None = None,
 ) -> None:
     if transport == "twilio":
-        await send_twilio_response(websocket, session, text, latency_t0=latency_t0)
+        await send_twilio_response(websocket, session, text)
         return
     audio_chunks = await get_tts().synthesize(session.session_id, text)
     for chunk in audio_chunks:
@@ -99,24 +97,19 @@ async def log_response_started(session: CallState) -> None:
     if session.current_turn_id is None or session.current_turn_response_started_logged:
         return
     session.current_turn_response_started_logged = True
-    payload: dict[str, int | str] = {"turn_id": session.current_turn_id}
+    latency_ms = None
     if session.current_turn_end_latency_t0 is not None:
-        turn_end_ms = max(0, int((time.time() - session.current_turn_end_latency_t0) * 1000))
-        payload["turn_end_to_response_started_ms"] = turn_end_ms
-    if session.current_eager_latency_t0 is not None:
-        eager_ms = max(0, int((time.time() - session.current_eager_latency_t0) * 1000))
-        payload["eager_end_to_response_started_ms"] = eager_ms
+        latency_ms = max(0, int((time.time() - session.current_turn_end_latency_t0) * 1000))
     logger.info(
-        "LATENCY [%s] turn_id=%s turn_end_to_response_started_ms=%s eager_end_to_response_started_ms=%s",
+        "LATENCY [%s] turn_id=%s latency_ms=%s",
         session.session_id,
         session.current_turn_id,
-        payload.get("turn_end_to_response_started_ms"),
-        payload.get("eager_end_to_response_started_ms"),
+        latency_ms,
     )
     await log_event(
         session.session_id,
         "response_started",
-        payload,
+        {"turn_id": session.current_turn_id, "latency_ms": latency_ms},
     )
     if session.current_turn_outcome is None:
         session.current_turn_outcome = "responded"
@@ -131,8 +124,6 @@ async def send_twilio_response(
     websocket: WebSocket,
     session: CallState,
     text: str,
-    *,
-    latency_t0: float | None = None,
 ) -> None:
     async with session.twilio_send_lock:
         logger.info("TURN [%s] TTS: %s", session.session_id, text)
@@ -151,7 +142,6 @@ async def send_twilio_response(
                         session,
                         bytes_buffer=mulaw_buffer,
                         first_audio_logged=first_audio_logged,
-                        latency_t0=latency_t0,
                     )
             except Exception as exc:
                 if "402" in str(exc) or "quota" in str(exc).lower():
@@ -247,7 +237,6 @@ async def send_audio_to_twilio(
     *,
     bytes_buffer: bytearray,
     first_audio_logged: bool,
-    latency_t0: float | None,
 ) -> bool:
     while len(bytes_buffer) >= TWILIO_FRAME_SIZE:
         if session.interrupted or session.response_buffer.superseded:
