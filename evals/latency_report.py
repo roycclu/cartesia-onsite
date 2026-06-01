@@ -26,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--format",
         choices=("json", "table", "csv"),
-        default="json",
-        help="Output format. Defaults to json.",
+        default="table",
+        help="Output format. Defaults to table.",
     )
     return parser.parse_args()
 
@@ -43,21 +43,14 @@ def build_query(view: str, has_session_id: bool) -> str:
             SELECT
               a.session_id,
               a.content::json->>'turn_id' AS turn_id,
-              a.timestamp::timestamptz AS asr_result_ts,
+              a.timestamp::timestamptz AS turn_end_ts,
               r.timestamp::timestamptz AS response_started_ts,
-              (r.content::json->>'latency_ms')::int AS latency_ms,
-              o.content::json->>'outcome' AS turn_outcome,
-              a.content::json AS asr_result_content,
-              r.content::json AS response_started_content,
-              o.content::json AS turn_outcome_content
+              ROUND(EXTRACT(EPOCH FROM (r.timestamp::timestamptz - a.timestamp::timestamptz)) * 1000)
+                AS turn_end_to_response_started_ms
             FROM compliance_log a
             JOIN compliance_log r
               ON a.session_id = r.session_id
              AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
-            LEFT JOIN compliance_log o
-              ON a.session_id = o.session_id
-             AND a.content::json->>'turn_id' = o.content::json->>'turn_id'
-             AND o.event_type = 'turn_outcome'
             WHERE a.event_type = 'asr_result'
               AND r.event_type = 'response_started'
               AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
