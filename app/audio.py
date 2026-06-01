@@ -38,38 +38,6 @@ class CartesiaTTS:
             "Cartesia-Version": self.version,
         }
 
-    async def stream_synthesize(self, session_id: str, text: str):
-        if not self.api_key:
-            silence = b"\x00\x00" * 1600
-            yield base64.b64encode(silence).decode("utf-8")
-            return
-        headers = self._headers()
-        payload = {
-            "model_id": "sonic-latest",
-            "transcript": text,
-            "voice": {"mode": "id", "id": self.voice_id},
-            "language": "en",
-            "context_id": str(uuid.uuid4()),
-            "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 8000},
-            "continue": False,
-        }
-        async with websockets.connect(TTS_URL, additional_headers=headers, max_size=8_000_000) as ws:
-            await ws.send(json.dumps(payload))
-            while True:
-                raw = await ws.recv()
-                if isinstance(raw, bytes):
-                    continue
-                message = json.loads(raw)
-                if message.get("type") == "chunk":
-                    yield message["data"]
-                if message.get("type") == "done":
-                    break
-                if message.get("type") == "error":
-                    raise RuntimeError(message.get("message", "Cartesia TTS error"))
-
-    async def synthesize(self, session_id: str, text: str) -> list[str]:
-        return [chunk async for chunk in self.stream_synthesize(session_id, text)]
-
     async def start_turn_context(self, websocket: WebSocket, session: CallState) -> str | None:
         if session.current_tts_open and session.current_tts_context_id and session.current_tts_ws is not None:
             return session.current_tts_context_id
@@ -247,32 +215,16 @@ async def send_agent_response(
     websocket: WebSocket,
     session: CallState,
     text: str,
-    transport: str = "cartesia",
     *,
     continue_response: bool = True,
 ) -> None:
-    if transport == "twilio":
-        await stream_twilio_response(websocket, session, text, continue_response=continue_response)
-        return
-    audio_chunks = await get_tts().synthesize(session.session_id, text)
-    for chunk in audio_chunks:
-        await websocket.send_json(
-            {
-                "event": "media_output",
-                "stream_id": session.stream_sid,
-                "media": {"payload": chunk},
-                "text": text,
-            }
-        )
+    await stream_twilio_response(websocket, session, text, continue_response=continue_response)
 
 
 async def finalize_agent_response(
     websocket: WebSocket,
     session: CallState,
-    transport: str = "cartesia",
 ) -> None:
-    if transport != "twilio":
-        return
     await finalize_twilio_response(websocket, session)
 
 
@@ -372,7 +324,7 @@ async def handle_tts_unavailable(websocket: WebSocket, session: CallState) -> No
         logger.info("tts_unavailable_socket_closed session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
 
 
-async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: str, transport: str = "cartesia") -> None:
+async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: str) -> None:
     payload = await trigger_handoff(session.session_id, reason, "Automatic fallback handoff")
     session.should_handoff = True
     session.handoff_reason = reason
@@ -384,36 +336,25 @@ async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: st
             "turn_outcome",
             {"turn_id": session.current_turn_id, "outcome": "handoff", "reason": reason},
         )
-    if transport == "twilio":
-        try:
-            await send_twilio_response(websocket, session, HUMAN_HANDOFF_PROMPT)
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "event": "mark",
-                        "streamSid": session.stream_sid,
-                        "mark": {"name": payload["reason_code"]},
-                    }
-                )
+    try:
+        await send_twilio_response(websocket, session, HUMAN_HANDOFF_PROMPT)
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event": "mark",
+                    "streamSid": session.stream_sid,
+                    "mark": {"name": payload["reason_code"]},
+                }
             )
-            await websocket.close(code=1000)
-        except RuntimeError:
-            logger.info(
-                "twilio_handoff_socket_closed session_id=%s stream_sid=%s reason=%s",
-                session.session_id,
-                session.stream_sid,
-                payload["reason_code"],
-            )
-        return
-    await websocket.send_json(
-        {
-            "event": "transfer_call",
-            "stream_id": session.stream_sid,
-            "reason": payload["reason_code"],
-            "text": HUMAN_HANDOFF_PROMPT,
-        }
-    )
-    await websocket.close(code=1011)
+        )
+        await websocket.close(code=1000)
+    except RuntimeError:
+        logger.info(
+            "twilio_handoff_socket_closed session_id=%s stream_sid=%s reason=%s",
+            session.session_id,
+            session.stream_sid,
+            payload["reason_code"],
+        )
 
 
 async def send_audio_to_twilio(

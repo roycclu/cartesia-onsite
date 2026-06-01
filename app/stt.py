@@ -146,6 +146,6 @@ class CartesiaTranscriber:
                 session.session_id,
                 session.stream_sid,
             )
-            await fail_safe_handoff(twilio_ws, session, f"cartesia_turns_exception:{exc}", transport="twilio")
+            await fail_safe_handoff(twilio_ws, session, f"cartesia_turns_exception:{exc}")
         finally:
             logger.info("cartesia_turn_stream_close session_id=%s stream_sid=%s", session.session_id, session.stream_sid)

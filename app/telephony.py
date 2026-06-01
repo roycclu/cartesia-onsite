@@ -148,7 +148,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
         if session is not None:
             await cancel_session_tasks(session)
             await get_transcriber().close_turn_stream(session)
-            await fail_safe_handoff(websocket, session, f"twilio_exception:{exc}", transport="twilio")
+            await fail_safe_handoff(websocket, session, f"twilio_exception:{exc}")
             await finalize_call(session, resolved=session.resolved)
         else:
             await websocket.close(code=1011)

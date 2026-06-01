@@ -193,7 +193,6 @@ def build_sentence_handler(session: CallState):
             session.twilio_websocket,
             session,
             sentence,
-            transport="twilio",
             continue_response=True,
         )
         session.response_buffer.sentence_complete()
@@ -225,12 +224,11 @@ async def handle_completed_turn(
                 websocket,
                 session,
                 response_text,
-                transport="twilio",
                 continue_response=True,
             )
             session.response_buffer.sentence_complete()
         if session.twilio_websocket is not None and session.response_buffer.sentences_sent > 0:
-            await finalize_agent_response(websocket, session, transport="twilio")
+            await finalize_agent_response(websocket, session)
         elif not response_text:
             await log_turn_outcome(session, "no_response_needed")
         session.pending_transcript = None
@@ -243,7 +241,7 @@ async def handle_completed_turn(
     except Exception as exc:
         logger.error("TURN_ERROR [%s] %s", session.session_id, exc)
         await log_turn_outcome(session, "error")
-        await fail_safe_handoff(websocket, session, "system_error", transport="twilio")
+        await fail_safe_handoff(websocket, session, "system_error")
 
 
 async def interrupt_twilio_playback(websocket: WebSocket, session: CallState) -> None:
