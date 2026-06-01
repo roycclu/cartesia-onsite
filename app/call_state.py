@@ -28,7 +28,6 @@ class ConversationState:
     handoff_reason: Optional[str] = None
     should_close: bool = False
     resolved: bool = False
-    name_acknowledged: bool = False
     history: list[dict[str, str]] = field(default_factory=list)
     turn_count: int = 0
     human_requests: int = 0
@@ -89,7 +88,6 @@ class CallState:
         "handoff_reason",
         "should_close",
         "resolved",
-        "name_acknowledged",
         "history",
         "turn_count",
         "human_requests",
@@ -203,7 +201,6 @@ class CallState:
             "verified": self.verified,
             "policy_number": self.policy_number,
             "holder_name": self.holder_name,
-            "name_acknowledged": self.name_acknowledged,
             "turn_count": self.turn_count,
             "pending_intent": self.pending_intent,
             "answered_queries": self.answered_queries,

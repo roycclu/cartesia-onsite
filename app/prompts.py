@@ -65,7 +65,6 @@ SYSTEM_PROMPT_VERIFIED = (
     "- Sound warm and human\n"
     "- Never repeat the policy number back to them\n"
     "- Never ask for verification again\n"
-    "{name_instruction}"
     "{repeated_query_instruction}"
     "State: {state}"
 )
