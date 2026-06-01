@@ -209,10 +209,11 @@ class LLMHelper:
                 "max_tokens": self.max_tokens,
             }
             self._validate_llm_params(params, "stream_response")
+            parts: list[str] = []
+            sentence_buffer = ""
+            completed_sentences: list[str] = []
             async with asyncio.timeout(self.timeout_seconds):
                 stream = await self.client.chat.completions.create(**params)
-                parts: list[str] = []
-                sentence_buffer = ""
                 async for chunk in stream:
                     delta = chunk.choices[0].delta.content or ""
                     if not delta:
@@ -220,21 +221,24 @@ class LLMHelper:
                     parts.append(delta)
                     sentence_buffer += delta
                     sentences, sentence_buffer = split_complete_sentences(sentence_buffer)
-                    for sentence in sentences:
-                        await sentence_handler(sentence)
-                if sentence_buffer.strip():
-                    await sentence_handler(sentence_buffer.strip())
-                    sentence_buffer = ""
+                    completed_sentences.extend(sentences)
+            for sentence in completed_sentences:
+                await sentence_handler(sentence)
+            if sentence_buffer.strip():
+                await sentence_handler(sentence_buffer.strip())
+                sentence_buffer = ""
             text = "".join(parts).strip() or self._fallback_response(state)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
             return text
         except Exception as exc:
             state["llm_error"] = str(exc)
-            emitted_output = call_state.response_buffer.sentences_sent > 0
+            emitted_output = call_state.current_turn_response_started_logged or call_state.response_buffer.sentences_sent > 0
             logger.exception(
-                "TURN_STREAM_ERROR [%s] emitted_output=%s error=%s",
+                "TURN_STREAM_ERROR [%s] emitted_output=%s response_started_logged=%s sentences_sent=%s error=%s",
                 state["session_id"],
                 emitted_output,
+                call_state.current_turn_response_started_logged,
+                call_state.response_buffer.sentences_sent,
                 exc,
             )
             if emitted_output:

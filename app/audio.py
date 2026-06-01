@@ -143,6 +143,16 @@ async def send_twilio_response(
                         bytes_buffer=mulaw_buffer,
                         first_audio_logged=first_audio_logged,
                     )
+            except asyncio.CancelledError:
+                if session.current_turn_response_started_logged or first_audio_logged:
+                    logger.info(
+                        "TTS_SEND_CANCELLED [%s] turn_id=%s response_started_logged=%s",
+                        session.session_id,
+                        session.current_turn_id,
+                        session.current_turn_response_started_logged,
+                    )
+                    return
+                raise
             except Exception as exc:
                 if "402" in str(exc) or "quota" in str(exc).lower():
                     logger.error("TTS_QUOTA_EXCEEDED [%s]", session.session_id)
@@ -248,7 +258,18 @@ async def send_audio_to_twilio(
         if not first_audio_logged:
             await log_response_started(session)
             first_audio_logged = True
-        await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
+        try:
+            await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
+        except asyncio.CancelledError:
+            if session.current_turn_response_started_logged or first_audio_logged:
+                logger.info(
+                    "TTS_FRAME_PACING_CANCELLED [%s] turn_id=%s response_started_logged=%s",
+                    session.session_id,
+                    session.current_turn_id,
+                    session.current_turn_response_started_logged,
+                )
+                return first_audio_logged
+            raise
     return first_audio_logged
 
 
