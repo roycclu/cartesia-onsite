@@ -26,6 +26,17 @@ def should_process_transcript(transcript: str) -> bool:
     return len(cleaned) >= 3
 
 
+async def log_turn_outcome(session: CallState, outcome: str) -> None:
+    if session.current_turn_id is None or session.current_turn_outcome is not None:
+        return
+    session.current_turn_outcome = outcome
+    await log_event(
+        session.session_id,
+        "turn_outcome",
+        {"turn_id": session.current_turn_id, "outcome": outcome},
+    )
+
+
 async def process_transcript(session: CallState, transcript: str) -> GraphState:
     await log_event(session.session_id, "user_transcript", {"text": transcript})
     if any(word in transcript.lower() for word in ("human", "representative", "agent")):
@@ -34,6 +45,7 @@ async def process_transcript(session: CallState, transcript: str) -> GraphState:
             payload = await trigger_handoff(session.session_id, "human_requested_twice", transcript)
             session.should_handoff = True
             session.handoff_reason = "human_requested_twice"
+            await log_turn_outcome(session, "handoff")
             response_text = HUMAN_REQUESTED_TWICE_PROMPT
             await log_event(
                 session.session_id,
@@ -163,6 +175,7 @@ async def resolve_speculative_turn(session: CallState, websocket: WebSocket, tra
     session.speculative_transcript = None
     session.pending_transcript = None
     session.interrupted = False
+    await log_turn_outcome(session, "superseded")
     return False
 
 
@@ -206,6 +219,7 @@ async def handle_completed_turn(
     try:
         if not should_process_transcript(transcript):
             logger.info("SKIP_NOISE_TURN [%s] transcript=%r", session.session_id, transcript)
+            await log_turn_outcome(session, "no_response_needed")
             return
         session.interrupted = False
         session.response_buffer.start()
@@ -220,6 +234,8 @@ async def handle_completed_turn(
         response_text = result.get("response_text") or result.get("response") or ""
         if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0 and response_text:
             await send_agent_response(websocket, session, response_text, transport="twilio", latency_t0=latency_t0)
+        elif not response_text:
+            await log_turn_outcome(session, "no_response_needed")
         session.pending_transcript = None
         if speculative:
             session.speculative_transcript = transcript
@@ -229,6 +245,7 @@ async def handle_completed_turn(
             await websocket.close(code=1000)
     except Exception as exc:
         logger.error("TURN_ERROR [%s] %s", session.session_id, exc)
+        await log_turn_outcome(session, "error")
         await fail_safe_handoff(websocket, session, "system_error", transport="twilio")
 
 

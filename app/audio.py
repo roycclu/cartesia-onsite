@@ -95,19 +95,36 @@ async def send_opening_greeting(websocket: WebSocket, session: CallState) -> Non
     await send_twilio_response(websocket, session, greeting)
 
 
-async def log_first_audio(session: CallState, latency_t0: float) -> None:
-    latency_ms = int((time.time() - latency_t0) * 1000)
+async def log_response_started(session: CallState) -> None:
+    if session.current_turn_id is None or session.current_turn_response_started_logged:
+        return
+    session.current_turn_response_started_logged = True
+    payload: dict[str, int | str] = {"turn_id": session.current_turn_id}
+    if session.current_turn_end_latency_t0 is not None:
+        turn_end_ms = max(0, int((time.time() - session.current_turn_end_latency_t0) * 1000))
+        payload["turn_end_to_response_started_ms"] = turn_end_ms
+    if session.current_eager_latency_t0 is not None:
+        eager_ms = max(0, int((time.time() - session.current_eager_latency_t0) * 1000))
+        payload["eager_end_to_response_started_ms"] = eager_ms
     logger.info(
-        "LATENCY [%s] turn_id=%s eager_end_to_first_audio_ms=%s",
+        "LATENCY [%s] turn_id=%s turn_end_to_response_started_ms=%s eager_end_to_response_started_ms=%s",
         session.session_id,
         session.current_turn_id,
-        latency_ms,
+        payload.get("turn_end_to_response_started_ms"),
+        payload.get("eager_end_to_response_started_ms"),
     )
     await log_event(
         session.session_id,
-        "first_audio",
-        {"turn_id": session.current_turn_id, "eager_end_to_first_audio_ms": latency_ms},
+        "response_started",
+        payload,
     )
+    if session.current_turn_outcome is None:
+        session.current_turn_outcome = "responded"
+        await log_event(
+            session.session_id,
+            "turn_outcome",
+            {"turn_id": session.current_turn_id, "outcome": "responded"},
+        )
 
 
 async def send_twilio_response(
@@ -148,8 +165,8 @@ async def send_twilio_response(
                     await send_clear_to_twilio(websocket, session)
                     return
                 await send_twilio_media_frame(websocket, session.stream_sid, padded_frame)
-                if latency_t0 is not None and not first_audio_logged:
-                    await log_first_audio(session, latency_t0)
+                if not first_audio_logged:
+                    await log_response_started(session)
                     first_audio_logged = True
                 await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
                 mulaw_buffer.clear()
@@ -185,6 +202,13 @@ async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: st
     payload = await trigger_handoff(session.session_id, reason, "Automatic fallback handoff")
     session.should_handoff = True
     session.handoff_reason = reason
+    if session.current_turn_id is not None and session.current_turn_outcome is None:
+        session.current_turn_outcome = "handoff"
+        await log_event(
+            session.session_id,
+            "turn_outcome",
+            {"turn_id": session.current_turn_id, "outcome": "handoff", "reason": reason},
+        )
     if transport == "twilio":
         try:
             await send_twilio_response(websocket, session, HUMAN_HANDOFF_PROMPT)
@@ -232,8 +256,8 @@ async def send_audio_to_twilio(
         frame = bytes(bytes_buffer[:TWILIO_FRAME_SIZE])
         del bytes_buffer[:TWILIO_FRAME_SIZE]
         await send_twilio_media_frame(websocket, session.stream_sid, frame)
-        if latency_t0 is not None and not first_audio_logged:
-            await log_first_audio(session, latency_t0)
+        if not first_audio_logged:
+            await log_response_started(session)
             first_audio_logged = True
         await asyncio.sleep(TWILIO_FRAME_PACE_SECONDS)
     return first_audio_logged

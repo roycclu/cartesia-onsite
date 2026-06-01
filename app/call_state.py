@@ -65,6 +65,10 @@ class CallState:
     twilio_websocket: Any = field(default=None, repr=False)
     current_latency_t0: float | None = None
     current_turn_id: str | None = None
+    current_eager_latency_t0: float | None = None
+    current_turn_end_latency_t0: float | None = None
+    current_turn_response_started_logged: bool = False
+    current_turn_outcome: str | None = None
 
     def merge_extracted_fields(self, extracted: dict[str, Any]) -> None:
         if extracted.get("policy_number") and not self.policy_number:
@@ -85,6 +89,10 @@ class CallState:
 
     def start_new_turn(self) -> str:
         self.current_turn_id = str(uuid.uuid4())[:8]
+        self.current_eager_latency_t0 = None
+        self.current_turn_end_latency_t0 = None
+        self.current_turn_response_started_logged = False
+        self.current_turn_outcome = None
         return self.current_turn_id
 
     def record_answered_query(self, query_type: str, result: dict[str, Any]) -> None:

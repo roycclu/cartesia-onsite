@@ -120,11 +120,13 @@ class CartesiaTranscriber:
                     transcript = (message.get("transcript") or "").strip()
                     if transcript and should_process_transcript(transcript):
                         t0 = time.time()
+                        session.current_eager_latency_t0 = t0
                         session.pending_transcript = transcript
                         start_speculative_task(session, twilio_ws, transcript, t0)
                     continue
                 if event_type == "turn.end":
                     transcript = (message.get("transcript") or "").strip()
+                    session.current_turn_end_latency_t0 = time.time()
                     logger.info("TURN [%s] USER: %s", session.session_id, transcript)
                     await log_event(
                         session.session_id,

@@ -16,8 +16,9 @@ import asyncpg
 class TurnMetrics:
     eager_end: datetime | None = None
     turn_end: datetime | None = None
-    first_audio: datetime | None = None
+    response_started: datetime | None = None
     speculative_outcome: str | None = None
+    turn_outcome: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,16 +73,19 @@ def build_turn_metrics(rows: list[asyncpg.Record]) -> dict[str, TurnMetrics]:
             turn.eager_end = timestamp
         elif row["event_type"] == "asr_result":
             turn.turn_end = timestamp
-        elif row["event_type"] == "first_audio":
-            turn.first_audio = timestamp
+        elif row["event_type"] == "response_started":
+            if turn.response_started is None or timestamp < turn.response_started:
+                turn.response_started = timestamp
         elif row["event_type"] == "speculative_resolution":
             turn.speculative_outcome = payload.get("outcome")
+        elif row["event_type"] == "turn_outcome":
+            turn.turn_outcome = payload.get("outcome")
     return turns
 
 
 def analyze_turns(turns: dict[str, TurnMetrics]) -> tuple[list[float], list[float], int, int]:
-    eager_end_to_first_audio_ms: list[float] = []
-    turn_end_to_first_audio_ms: list[float] = []
+    eager_end_to_response_started_ms: list[float] = []
+    turn_end_to_response_started_ms: list[float] = []
     speculative_total = 0
     speculative_hits = 0
 
@@ -90,14 +94,14 @@ def analyze_turns(turns: dict[str, TurnMetrics]) -> tuple[list[float], list[floa
             speculative_total += 1
             if turn.speculative_outcome == "hit":
                 speculative_hits += 1
-        if turn.speculative_outcome == "miss":
+        if turn.turn_outcome != "responded" or turn.speculative_outcome == "miss":
             continue
-        if turn.eager_end is not None and turn.first_audio is not None:
-            eager_end_to_first_audio_ms.append((turn.first_audio - turn.eager_end).total_seconds() * 1000)
-        if turn.turn_end is not None and turn.first_audio is not None:
-            turn_end_to_first_audio_ms.append((turn.first_audio - turn.turn_end).total_seconds() * 1000)
+        if turn.eager_end is not None and turn.response_started is not None:
+            eager_end_to_response_started_ms.append(max(0.0, (turn.response_started - turn.eager_end).total_seconds() * 1000))
+        if turn.turn_end is not None and turn.response_started is not None:
+            turn_end_to_response_started_ms.append(max(0.0, (turn.response_started - turn.turn_end).total_seconds() * 1000))
 
-    return eager_end_to_first_audio_ms, turn_end_to_first_audio_ms, speculative_hits, speculative_total
+    return eager_end_to_response_started_ms, turn_end_to_response_started_ms, speculative_hits, speculative_total
 
 
 async def main() -> None:
@@ -113,7 +117,7 @@ async def main() -> None:
             """
             SELECT session_id, event_type, content, timestamp
             FROM compliance_log
-            WHERE event_type IN ('turn_eager_end', 'asr_result', 'first_audio', 'speculative_resolution')
+            WHERE event_type IN ('turn_eager_end', 'asr_result', 'response_started', 'speculative_resolution', 'turn_outcome')
               AND timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
             ORDER BY id ASC
             """,
@@ -133,14 +137,14 @@ async def main() -> None:
         await conn.close()
 
     turns = build_turn_metrics(log_rows)
-    eager_end_to_first_audio_ms, turn_end_to_first_audio_ms, speculative_hits, speculative_total = analyze_turns(turns)
+    eager_end_to_response_started_ms, turn_end_to_response_started_ms, speculative_hits, speculative_total = analyze_turns(turns)
 
-    eager_p50 = percentile(eager_end_to_first_audio_ms, 0.50)
-    eager_p75 = percentile(eager_end_to_first_audio_ms, 0.75)
-    eager_p95 = percentile(eager_end_to_first_audio_ms, 0.95)
-    turn_end_p50 = percentile(turn_end_to_first_audio_ms, 0.50)
-    turn_end_p75 = percentile(turn_end_to_first_audio_ms, 0.75)
-    turn_end_p95 = percentile(turn_end_to_first_audio_ms, 0.95)
+    eager_p50 = percentile(eager_end_to_response_started_ms, 0.50)
+    eager_p75 = percentile(eager_end_to_response_started_ms, 0.75)
+    eager_p95 = percentile(eager_end_to_response_started_ms, 0.95)
+    turn_end_p50 = percentile(turn_end_to_response_started_ms, 0.50)
+    turn_end_p75 = percentile(turn_end_to_response_started_ms, 0.75)
+    turn_end_p95 = percentile(turn_end_to_response_started_ms, 0.95)
     speculative_hit_rate = (speculative_hits / speculative_total * 100) if speculative_total else None
 
     total_calls = len(call_rows)
@@ -152,15 +156,15 @@ async def main() -> None:
     print()
     print(f"Lookback window: last {args.hours} hour(s)")
     print()
-    print("1. Eager End To First Audio")
-    print(f"p50: {fmt_ms(eager_p50)}")
-    print(f"p75: {fmt_ms(eager_p75)}")
-    print(f"p95: {fmt_ms(eager_p95)}")
-    print()
-    print("2. Turn End To First Audio")
+    print("1. Turn End To Response Started")
     print(f"p50: {fmt_ms(turn_end_p50)}")
     print(f"p75: {fmt_ms(turn_end_p75)}")
     print(f"p95: {fmt_ms(turn_end_p95)}")
+    print()
+    print("2. Eager End To Response Started")
+    print(f"p50: {fmt_ms(eager_p50)}")
+    print(f"p75: {fmt_ms(eager_p75)}")
+    print(f"p95: {fmt_ms(eager_p95)}")
     print()
     print("3. Speculative Execution")
     print(f"Hit rate: {fmt_pct(speculative_hit_rate)}")
@@ -175,11 +179,11 @@ async def main() -> None:
     print("--------")
 
     has_warning = False
-    if eager_p50 is not None and eager_p50 > 3000:
-        print(f"WARNING: eager-end p50 is high at {fmt_ms(eager_p50)}; rerun with --hours 2 to isolate recent calls.")
-        has_warning = True
     if turn_end_p50 is not None and turn_end_p50 > 3000:
         print(f"WARNING: turn-end p50 is high at {fmt_ms(turn_end_p50)}; rerun with --hours 2 to isolate recent calls.")
+        has_warning = True
+    if eager_p50 is not None and eager_p50 > 3000:
+        print(f"WARNING: eager-end p50 is high at {fmt_ms(eager_p50)}; rerun with --hours 2 to isolate recent calls.")
         has_warning = True
     if speculative_hit_rate is not None and speculative_hit_rate < 80:
         print(f"WARNING: speculative hit rate is low at {fmt_pct(speculative_hit_rate)}")

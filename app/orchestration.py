@@ -341,9 +341,17 @@ class InsuranceOrchestrator:
             if call_state.verification_attempts >= 3:
                 call_state.should_handoff = True
                 call_state.handoff_reason = "verification_failed"
+                should_log_handoff = call_state.current_turn_outcome is None
+                call_state.current_turn_outcome = call_state.current_turn_outcome or "handoff"
                 state["should_handoff"] = True
                 state["handoff_reason"] = "verification_failed"
                 state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", state["transcript"])
+                if should_log_handoff:
+                    await log_event(
+                        state["session_id"],
+                        "turn_outcome",
+                        {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": "verification_failed"},
+                    )
                 state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
                 return state
             state["tool_result"] = {"verified": False}
@@ -399,10 +407,18 @@ class InsuranceOrchestrator:
         if call_state.verification_attempts >= 3:
             call_state.should_handoff = True
             call_state.handoff_reason = "verification_failed"
+            should_log_handoff = call_state.current_turn_outcome is None
+            call_state.current_turn_outcome = call_state.current_turn_outcome or "handoff"
             state["should_handoff"] = True
             state["handoff_reason"] = "verification_failed"
             state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", state["transcript"])
             call_state.latest_tool_result = state["tool_result"]
+            if should_log_handoff:
+                await log_event(
+                    state["session_id"],
+                    "turn_outcome",
+                    {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": "verification_failed"},
+                )
             state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
             return state
 
@@ -442,19 +458,35 @@ class InsuranceOrchestrator:
         if intent == "handoff":
             call_state.should_handoff = True
             call_state.handoff_reason = "human_requested"
+            should_log_handoff = call_state.current_turn_outcome is None
+            call_state.current_turn_outcome = call_state.current_turn_outcome or "handoff"
             state["should_handoff"] = True
             state["handoff_reason"] = "human_requested"
             state["tool_result"] = await trigger_handoff(state["session_id"], "human_requested", transcript)
             call_state.latest_tool_result = state["tool_result"]
+            if should_log_handoff:
+                await log_event(
+                    state["session_id"],
+                    "turn_outcome",
+                    {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": "human_requested"},
+                )
             return state
 
         if intent in {"write_request", "out_of_scope"}:
             call_state.should_handoff = True
             call_state.handoff_reason = intent
+            should_log_handoff = call_state.current_turn_outcome is None
+            call_state.current_turn_outcome = call_state.current_turn_outcome or "handoff"
             state["should_handoff"] = True
             state["handoff_reason"] = intent
             state["tool_result"] = await trigger_handoff(state["session_id"], intent, transcript)
             call_state.latest_tool_result = state["tool_result"]
+            if should_log_handoff:
+                await log_event(
+                    state["session_id"],
+                    "turn_outcome",
+                    {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": intent},
+                )
             return state
 
         if call_state.already_answered(intent):
