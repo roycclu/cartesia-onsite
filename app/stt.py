@@ -117,7 +117,7 @@ class CartesiaTranscriber:
                     continue
                 if event_type == "turn.eager_end":
                     transcript = (message.get("transcript") or "").strip()
-                    if session.verified and transcript and should_process_transcript(transcript):
+                    if transcript and should_process_transcript(transcript):
                         session.pending_transcript = transcript
                         start_speculative_task(session, twilio_ws, transcript, time.time())
                     continue

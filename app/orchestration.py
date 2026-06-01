@@ -17,10 +17,10 @@ from app.prompts import (
     GREETING_PROMPT,
     INTENT_CLASSIFICATION_PROMPT,
     LLM_ERROR_PROMPT,
-    OUT_OF_SCOPE_PROMPT,
     PROMPT_VERSION,
     REPEATED_QUERY_INSTRUCTION,
     SYSTEM_PROMPT_VERIFIED,
+    UNKNOWN_REQUEST_PROMPT,
     VERIFICATION_FAILED_HANDOFF_PROMPT,
     VERIFICATION_PROMPT,
     VERIFICATION_SUCCESS_PROMPT,
@@ -37,7 +37,6 @@ ALLOWED_INTENTS = {
     "get_claim_status",
     "get_policy_info",
     "handoff",
-    "out_of_scope",
     "write_request",
     "end_conversation",
     "unknown",
@@ -48,7 +47,6 @@ Intent = Literal[
     "get_claim_status",
     "get_policy_info",
     "handoff",
-    "out_of_scope",
     "write_request",
     "end_conversation",
     "unknown",
@@ -93,9 +91,6 @@ class LLMHelper:
         if any(phrase in lowered for phrase in ("update my", "change my", "file a claim", "cancel my policy", "pay my bill")):
             logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "write_request"
-        if any(phrase in lowered for phrase in ("weather", "sports", "restaurant", "flight")):
-            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
-            return "out_of_scope"
         if "claim" in lowered or "status" in lowered:
             logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "get_claim_status"
@@ -126,10 +121,16 @@ class LLMHelper:
         except Exception:
             return self._fallback_greeting()
 
-    async def generate_verification_prompt(self, attempts: int, recent_history: list[dict[str, str]] | None = None) -> str:
+    async def generate_verification_prompt(
+        self,
+        attempts: int,
+        recent_history: list[dict[str, str]] | None = None,
+        current_transcript: str | None = None,
+    ) -> str:
         prompt = VERIFICATION_PROMPT.format(
             attempts=attempts,
             recent_history=recent_history or [],
+            current_transcript=current_transcript or "",
         )
         try:
             params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
@@ -261,7 +262,11 @@ class LLMHelper:
         result = state.get("tool_result") or {}
         intent = state.get("intent", "unknown")
         if call_state.should_handoff:
-            return VERIFICATION_FAILED_HANDOFF_PROMPT if call_state.handoff_reason == "verification_failed" else OUT_OF_SCOPE_PROMPT
+            if call_state.handoff_reason == "verification_failed":
+                return VERIFICATION_FAILED_HANDOFF_PROMPT
+            if call_state.handoff_reason == "unknown":
+                return UNKNOWN_REQUEST_PROMPT
+            return WRITE_REQUEST_PROMPT
         if state.get("repeated_query"):
             if intent == "get_claim_status" and "claim_id" in result:
                 return f"As I mentioned, your claim {result['claim_id']} is {result['status']}."
@@ -383,12 +388,6 @@ class InsuranceOrchestrator:
                     )
                 state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
                 return state
-            state["tool_result"] = {"verified": False}
-            state["response_text"] = await self.llm.generate_verification_prompt(
-                call_state.verification_attempts,
-                call_state.history[-4:],
-            )
-            call_state.verification_attempts += 1
             return state
 
         logger.info(
@@ -447,6 +446,7 @@ class InsuranceOrchestrator:
         state["response_text"] = await self.llm.generate_verification_prompt(
             call_state.verification_attempts,
             call_state.history[-4:],
+            state["transcript"],
         )
         return state
 
@@ -494,7 +494,7 @@ class InsuranceOrchestrator:
                 )
             return state
 
-        if intent in {"write_request", "out_of_scope"}:
+        if intent in {"write_request", "unknown"}:
             call_state.should_handoff = True
             call_state.handoff_reason = intent
             should_log_handoff = call_state.current_turn_outcome is None
@@ -509,6 +509,33 @@ class InsuranceOrchestrator:
                     "turn_outcome",
                     {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": intent},
                 )
+            return state
+
+        if not call_state.verified:
+            if call_state.verification_attempts >= 3:
+                call_state.should_handoff = True
+                call_state.handoff_reason = "verification_failed"
+                should_log_handoff = call_state.current_turn_outcome is None
+                call_state.current_turn_outcome = call_state.current_turn_outcome or "handoff"
+                state["should_handoff"] = True
+                state["handoff_reason"] = "verification_failed"
+                state["tool_result"] = await trigger_handoff(state["session_id"], "verification_failed", transcript)
+                call_state.latest_tool_result = state["tool_result"]
+                if should_log_handoff:
+                    await log_event(
+                        state["session_id"],
+                        "turn_outcome",
+                        {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": "verification_failed"},
+                    )
+                state["response_text"] = VERIFICATION_FAILED_HANDOFF_PROMPT
+                return state
+            state["tool_result"] = {"verified": False}
+            state["response_text"] = await self.llm.generate_verification_prompt(
+                call_state.verification_attempts,
+                call_state.history[-4:],
+                transcript,
+            )
+            call_state.verification_attempts += 1
             return state
 
         if call_state.already_answered(intent):
@@ -561,6 +588,21 @@ class InsuranceOrchestrator:
         return None
 
     async def _generate_response(self, state: GraphState) -> GraphState:
+        prebuilt_response = state.get("response_text")
+        if prebuilt_response:
+            sentence_handler = state.get("sentence_handler")
+            if sentence_handler is not None:
+                await emit_sentences(prebuilt_response, sentence_handler)
+            await log_event(
+                state["session_id"],
+                "llm_response",
+                {
+                    "text": prebuilt_response,
+                    "handoff": state["call_state"].should_handoff,
+                    "turn_id": state["call_state"].current_turn_id,
+                },
+            )
+            return state
         logger.info(
             "LLM_INPUT [%s] verified=%s proceeding_to_intent=%s",
             state["session_id"],

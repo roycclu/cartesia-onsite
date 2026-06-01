@@ -12,6 +12,8 @@ GREETING_PROMPT = (
 
 VERIFICATION_PROMPT = (
     "You are a friendly insurance call center agent for Acme Insurance.\n\n"
+    "Current caller request:\n"
+    "{current_transcript}\n\n"
     "Recent conversation:\n"
     "{recent_history}\n\n"
     "The caller needs to verify with policy number and last 4 digits of SSN.\n"
@@ -39,14 +41,14 @@ VERIFICATION_FAILED_HANDOFF_PROMPT = "I’m transferring you to a human represen
 HUMAN_HANDOFF_PROMPT = "I’m transferring you to a human representative for further help."
 HUMAN_REQUESTED_TWICE_PROMPT = "I’m connecting you with a human representative now."
 LLM_ERROR_PROMPT = "I’m having trouble completing that request. I’ll connect you with a human representative."
-OUT_OF_SCOPE_PROMPT = "That request is outside this insurance support demo, so I’m transferring you to a human representative."
+UNKNOWN_REQUEST_PROMPT = "That request is outside this insurance support demo, so I’m transferring you to a human representative."
 WRITE_REQUEST_PROMPT = "I can’t make account changes in this demo, so I’m connecting you with a human representative."
 END_CONVERSATION_PROMPT = "That’s everything I needed. Thanks for calling, and have a good day."
 REPEATED_QUERY_INSTRUCTION = "The caller already received this answer earlier in the call. Respond briefly with 'As I mentioned' and restate the answer without calling any tools again."
 
 INTENT_CLASSIFICATION_PROMPT = (
     "Classify the insurance call center request into one of: "
-    "get_claim_status, get_policy_info, handoff, out_of_scope, write_request, end_conversation, unknown. "
+    "get_claim_status, get_policy_info, handoff, write_request, end_conversation, unknown. "
     "Transcript: {transcript}"
 )
 
