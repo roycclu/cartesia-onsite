@@ -3,122 +3,137 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter
+import csv
+import json
 import os
+import sys
+from typing import Any
 
 import asyncpg
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Report canonical turn latency from compliance logs.")
+    parser = argparse.ArgumentParser(description="Fetch raw latency-related rows from compliance logs.")
     parser.add_argument("--hours", type=int, default=24, help="Lookback window in hours. Defaults to 24.")
-    parser.add_argument("--session-id", help="Optional session_id filter for debugging a single call.")
+    parser.add_argument("--session-id", help="Optional session_id filter.")
+    parser.add_argument("--limit", type=int, default=100, help="Maximum rows to return. Defaults to 100.")
+    parser.add_argument(
+        "--view",
+        choices=("joined", "response_started", "asr_result", "turn_outcome", "latency"),
+        default="joined",
+        help="Which raw view to fetch. Defaults to joined.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("json", "table", "csv"),
+        default="json",
+        help="Output format. Defaults to json.",
+    )
     return parser.parse_args()
 
 
-def percentile(values: list[int], pct: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return float(ordered[0])
-    rank = (len(ordered) - 1) * pct
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    weight = rank - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+def _json_default(value: Any) -> str:
+    return str(value)
 
 
-def fmt_ms(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.0f}ms"
-
-
-async def fetch_latency_rows(conn: asyncpg.Connection, hours: int, session_id: str | None) -> list[asyncpg.Record]:
-    if session_id:
-        return await conn.fetch(
-            """
-            WITH turn_latency AS (
-              SELECT
-                a.session_id,
-                a.content::json->>'turn_id' AS turn_id,
-                a.timestamp::timestamptz AS turn_end_ts,
-                r.timestamp::timestamptz AS response_started_ts,
-                (r.content::json->>'latency_ms')::int AS latency_ms,
-                o.content::json->>'outcome' AS turn_outcome
-              FROM compliance_log a
-              JOIN compliance_log r
-                ON a.session_id = r.session_id
-               AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
-              LEFT JOIN compliance_log o
-                ON a.session_id = o.session_id
-               AND a.content::json->>'turn_id' = o.content::json->>'turn_id'
-               AND o.event_type = 'turn_outcome'
-              WHERE a.event_type = 'asr_result'
-                AND r.event_type = 'response_started'
-                AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
-                AND a.session_id = $2
-            )
-            SELECT session_id, turn_id, turn_end_ts, response_started_ts, latency_ms, turn_outcome
-            FROM turn_latency
-            ORDER BY response_started_ts DESC
-            """,
-            hours,
-            session_id,
-        )
-    return await conn.fetch(
+def build_query(view: str, has_session_id: bool) -> str:
+    session_clause = "AND session_id = $3" if has_session_id else ""
+    if view == "joined":
+        return f"""
+            SELECT
+              a.session_id,
+              a.content::json->>'turn_id' AS turn_id,
+              a.timestamp::timestamptz AS asr_result_ts,
+              r.timestamp::timestamptz AS response_started_ts,
+              (r.content::json->>'latency_ms')::int AS latency_ms,
+              o.content::json->>'outcome' AS turn_outcome,
+              a.content::json AS asr_result_content,
+              r.content::json AS response_started_content,
+              o.content::json AS turn_outcome_content
+            FROM compliance_log a
+            JOIN compliance_log r
+              ON a.session_id = r.session_id
+             AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
+            LEFT JOIN compliance_log o
+              ON a.session_id = o.session_id
+             AND a.content::json->>'turn_id' = o.content::json->>'turn_id'
+             AND o.event_type = 'turn_outcome'
+            WHERE a.event_type = 'asr_result'
+              AND r.event_type = 'response_started'
+              AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
+              {session_clause}
+            ORDER BY r.timestamp::timestamptz DESC
+            LIMIT $2
         """
-        WITH turn_latency AS (
-          SELECT
-            a.session_id,
-            a.content::json->>'turn_id' AS turn_id,
-            a.timestamp::timestamptz AS turn_end_ts,
-            r.timestamp::timestamptz AS response_started_ts,
-            (r.content::json->>'latency_ms')::int AS latency_ms,
-            o.content::json->>'outcome' AS turn_outcome
-          FROM compliance_log a
-          JOIN compliance_log r
-            ON a.session_id = r.session_id
-           AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
-          LEFT JOIN compliance_log o
-            ON a.session_id = o.session_id
-           AND a.content::json->>'turn_id' = o.content::json->>'turn_id'
-           AND o.event_type = 'turn_outcome'
-          WHERE a.event_type = 'asr_result'
-            AND r.event_type = 'response_started'
-            AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
-        )
-        SELECT session_id, turn_id, turn_end_ts, response_started_ts, latency_ms, turn_outcome
-        FROM turn_latency
-        ORDER BY response_started_ts DESC
-        """,
-        hours,
-    )
+    return f"""
+        SELECT session_id, event_type, timestamp::timestamptz AS event_ts, content::json AS content
+        FROM compliance_log
+        WHERE event_type = '{view}'
+          AND timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
+          {session_clause}
+        ORDER BY timestamp::timestamptz DESC
+        LIMIT $2
+    """
 
 
-async def fetch_call_rows(conn: asyncpg.Connection, hours: int, session_id: str | None) -> list[asyncpg.Record]:
-    if session_id:
-        return await conn.fetch(
-            """
-            SELECT call_id, resolved, handoff_reason
-            FROM calls
-            WHERE started_at >= NOW() - make_interval(hours => $1::int)
-              AND session_id::text = $2
-            ORDER BY started_at DESC
-            """,
-            hours,
-            session_id,
+async def fetch_rows(conn: asyncpg.Connection, args: argparse.Namespace) -> list[asyncpg.Record]:
+    query = build_query(args.view, bool(args.session_id))
+    if args.session_id:
+        return await conn.fetch(query, args.hours, args.limit, args.session_id)
+    return await conn.fetch(query, args.hours, args.limit)
+
+
+def normalize_row(row: asyncpg.Record) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in dict(row).items():
+        if isinstance(value, str):
+            try:
+                normalized[key] = json.loads(value)
+                continue
+            except json.JSONDecodeError:
+                pass
+        normalized[key] = value
+    return normalized
+
+
+def print_json(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        print(json.dumps(row, default=_json_default))
+
+
+def print_csv(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    writer = csv.DictWriter(sys.stdout, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                key: json.dumps(value, default=_json_default) if isinstance(value, (dict, list)) else value
+                for key, value in row.items()
+            }
         )
-    return await conn.fetch(
-        """
-        SELECT call_id, resolved, handoff_reason
-        FROM calls
-        WHERE started_at >= NOW() - make_interval(hours => $1::int)
-        ORDER BY started_at DESC
-        """,
-        hours,
-    )
+
+
+def print_table(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    headers = list(rows[0].keys())
+    rendered_rows = [
+        [
+            json.dumps(value, default=_json_default) if isinstance(value, (dict, list)) else str(value)
+            for value in row.values()
+        ]
+        for row in rows
+    ]
+    widths = [len(header) for header in headers]
+    for rendered in rendered_rows:
+        for i, value in enumerate(rendered):
+            widths[i] = max(widths[i], len(value))
+    print(" | ".join(header.ljust(widths[i]) for i, header in enumerate(headers)))
+    print("-+-".join("-" * width for width in widths))
+    for rendered in rendered_rows:
+        print(" | ".join(value.ljust(widths[i]) for i, value in enumerate(rendered)))
 
 
 async def main() -> None:
@@ -129,62 +144,17 @@ async def main() -> None:
 
     conn = await asyncpg.connect(database_url)
     try:
-        latency_rows = await fetch_latency_rows(conn, args.hours, args.session_id)
-        call_rows = await fetch_call_rows(conn, args.hours, args.session_id)
+        rows = await fetch_rows(conn, args)
     finally:
         await conn.close()
 
-    outcome_counts = Counter((row["turn_outcome"] or "unknown") for row in latency_rows)
-    responded_latencies = [row["latency_ms"] for row in latency_rows if row["turn_outcome"] == "responded" and row["latency_ms"] is not None]
-
-    p50 = percentile(responded_latencies, 0.50)
-    p75 = percentile(responded_latencies, 0.75)
-    p95 = percentile(responded_latencies, 0.95)
-
-    total_calls = len(call_rows)
-    contained_calls = sum(1 for row in call_rows if row["resolved"] and not row["handoff_reason"])
-
-    print("Latency Report")
-    print("==============")
-    print()
-    print(f"Lookback window: last {args.hours} hour(s)")
-    if args.session_id:
-        print(f"Session filter: {args.session_id}")
-    print()
-    print("1. Turn End To First TTS Stream Start")
-    print(f"p50: {fmt_ms(p50)}")
-    print(f"p75: {fmt_ms(p75)}")
-    print(f"p95: {fmt_ms(p95)}")
-    print(f"Measured turns: {len(responded_latencies)}")
-    print()
-    print("2. Turn Outcomes")
-    print(f"responded: {outcome_counts.get('responded', 0)}")
-    print(f"no_response_needed: {outcome_counts.get('no_response_needed', 0)}")
-    print(f"handoff: {outcome_counts.get('handoff', 0)}")
-    print(f"error: {outcome_counts.get('error', 0)}")
-    print(f"superseded: {outcome_counts.get('superseded', 0)}")
-    print(f"unknown: {outcome_counts.get('unknown', 0)}")
-    print()
-    print("3. Call Summary")
-    print(f"Total calls: {total_calls}")
-    print(f"Contained calls: {contained_calls}")
-    print()
-    print("Sanity Check")
-    print("------------")
-    print(f"Joined latency rows: {len(latency_rows)}")
-    print(f"Rows contributing to percentiles: {len(responded_latencies)}")
-    print()
-    print("Warnings")
-    print("--------")
-    has_warning = False
-    if p50 is not None and p50 > 3000:
-        print(f"WARNING: latency p50 is high at {fmt_ms(p50)}")
-        has_warning = True
-    if not responded_latencies:
-        print("WARNING: no responded turns found in the selected window.")
-        has_warning = True
-    if not has_warning:
-        print("No threshold warnings.")
+    normalized_rows = [normalize_row(row) for row in rows]
+    if args.format == "json":
+        print_json(normalized_rows)
+    elif args.format == "csv":
+        print_csv(normalized_rows)
+    else:
+        print_table(normalized_rows)
 
 
 if __name__ == "__main__":
