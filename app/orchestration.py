@@ -28,7 +28,7 @@ from app.prompts import (
 )
 from app.tools.extractors import extract_fields
 from app.tools.insurance import get_claim_status, get_policy_info, trigger_handoff, verify_identity
-from app.tools.text_utils import emit_sentences, split_complete_sentences
+from app.tools.text_utils import emit_sentences, split_speakable_chunks
 
 logger = logging.getLogger("voice_agent")
 
@@ -210,23 +210,25 @@ class LLMHelper:
             }
             self._validate_llm_params(params, "stream_response")
             parts: list[str] = []
-            sentence_buffer = ""
-            completed_sentences: list[str] = []
-            async with asyncio.timeout(self.timeout_seconds):
-                stream = await self.client.chat.completions.create(**params)
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    if not delta:
-                        continue
-                    parts.append(delta)
-                    sentence_buffer += delta
-                    sentences, sentence_buffer = split_complete_sentences(sentence_buffer)
-                    completed_sentences.extend(sentences)
-            for sentence in completed_sentences:
-                await sentence_handler(sentence)
-            if sentence_buffer.strip():
-                await sentence_handler(sentence_buffer.strip())
-                sentence_buffer = ""
+            chunk_buffer = ""
+            stream = await self.client.chat.completions.create(**params)
+            while True:
+                try:
+                    async with asyncio.timeout(self.timeout_seconds):
+                        chunk = await stream.__anext__()
+                except StopAsyncIteration:
+                    break
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                parts.append(delta)
+                chunk_buffer += delta
+                chunks, chunk_buffer = split_speakable_chunks(chunk_buffer)
+                for speakable_chunk in chunks:
+                    await sentence_handler(speakable_chunk)
+            if chunk_buffer.strip():
+                await sentence_handler(chunk_buffer)
+                chunk_buffer = ""
             text = "".join(parts).strip() or self._fallback_response(state)
             logger.info("TURN [%s] LLM: %s", state["session_id"], text)
             return text
@@ -242,7 +244,7 @@ class LLMHelper:
                 exc,
             )
             if emitted_output:
-                text = "".join(parts).strip() or sentence_buffer.strip()
+                text = "".join(parts).strip() or chunk_buffer.strip()
                 logger.info("TURN [%s] LLM_PARTIAL: %s", state["session_id"], text)
                 return text
             text = self._fallback_response(state)
@@ -302,15 +304,13 @@ class InsuranceOrchestrator:
     def __init__(self) -> None:
         self.llm = LLMHelper()
         graph = StateGraph(GraphState)
-        graph.add_node("field_extraction", self._extract_fields_node)
-        graph.add_node("verification", self._verification_node)
+        graph.add_node("verify_or_gate", self._verify_or_gate)
         graph.add_node("intent_classification", self._classify_intent)
         graph.add_node("tool_execution", self._execute_tools)
         graph.add_node("response_generation", self._generate_response)
-        graph.set_entry_point("field_extraction")
-        graph.add_edge("field_extraction", "verification")
+        graph.set_entry_point("verify_or_gate")
         graph.add_conditional_edges(
-            "verification",
+            "verify_or_gate",
             self._route_after_verification,
             {"end": END, "intent_classification": "intent_classification"},
         )
@@ -327,7 +327,7 @@ class InsuranceOrchestrator:
     async def generate_greeting(self) -> str:
         return await self.llm.generate_greeting()
 
-    async def _extract_fields_node(self, state: GraphState) -> GraphState:
+    async def _verify_or_gate(self, state: GraphState) -> GraphState:
         call_state = state["call_state"]
         extracted = extract_fields(state["transcript"])
         call_state.merge_extracted_fields(extracted)
@@ -347,10 +347,6 @@ class InsuranceOrchestrator:
                 "ssn_last4": call_state.ssn_last4,
             },
         )
-        return state
-
-    async def _verification_node(self, state: GraphState) -> GraphState:
-        call_state = state["call_state"]
         if call_state.verified:
             return state
 
@@ -412,23 +408,15 @@ class InsuranceOrchestrator:
             call_state.holder_name = verification.get("holder_name")
             call_state.latest_tool_result = verification
             call_state.verification_attempts = 0
-            call_state.last_verification_failed = False
             pending_intent = call_state.pending_intent
-            should_emit_transition = not call_state.post_verification_greeted
-            if should_emit_transition:
-                call_state.post_verification_greeted = True
-                call_state.name_acknowledged = True
+            call_state.name_acknowledged = True
             if pending_intent:
-                intent = pending_intent
-                transcript = call_state.pending_intent_transcript or state["transcript"]
+                state["intent"] = pending_intent
+                state["transcript"] = call_state.pending_intent_transcript or state["transcript"]
                 call_state.pending_intent = None
                 call_state.pending_intent_transcript = None
-                state["intent"] = intent
-                state["transcript"] = transcript
-                logger.info("PENDING_INTENT_RESOLVED [%s] intent=%s", state["session_id"], intent)
-                state = await self._execute_tools(state)
-                return await self._generate_response(state)
-            if should_emit_transition:
+                logger.info("PENDING_INTENT_RESOLVED [%s] intent=%s", state["session_id"], state["intent"])
+            else:
                 state["response_text"] = "Thanks, you're all set. What can I help with?"
             return state
 
@@ -464,9 +452,10 @@ class InsuranceOrchestrator:
 
     async def _classify_intent(self, state: GraphState) -> GraphState:
         call_state = state["call_state"]
-        intent = await self.llm.classify_intent(state["transcript"])
+        intent = state.get("intent") or await self.llm.classify_intent(state["transcript"])
         state["intent"] = intent
-        call_state.capture_pending_intent(intent, state["transcript"])
+        if call_state.pending_intent is None:
+            call_state.capture_pending_intent(intent, state["transcript"])
         if call_state.pending_intent == intent and call_state.pending_intent_transcript == state["transcript"]:
             logger.info("PENDING_INTENT captured: %s from: %s", intent, state["transcript"])
         await log_event(state["session_id"], "intent_classification", {"transcript": state["transcript"], "intent": intent})
@@ -522,15 +511,6 @@ class InsuranceOrchestrator:
             state["tool_result"] = call_state.answered_queries[intent]
             call_state.latest_tool_result = state["tool_result"]
             return state
-
-        prefetched = call_state.prefetched_data.get(intent)
-        if prefetched is not None:
-            logger.info("PREFETCH [%s] intent=%s hit=true", state["session_id"], intent)
-            call_state.record_answered_query(intent, prefetched)
-            state["tool_result"] = prefetched
-            return state
-        if intent in {"get_claim_status", "get_policy_info"}:
-            logger.info("PREFETCH [%s] intent=%s hit=false", state["session_id"], intent)
 
         if intent == "get_claim_status":
             result = await get_claim_status(state["session_id"], call_state.policy_number or "")

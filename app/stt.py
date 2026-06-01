@@ -16,7 +16,6 @@ from app.compliance import log_event
 from app.turn_handler import (
     handle_completed_turn,
     interrupt_twilio_playback,
-    maybe_prefetch_from_partial,
     resolve_speculative_turn,
     schedule_response_task,
     should_process_transcript,
@@ -107,8 +106,6 @@ class CartesiaTranscriber:
                     continue
                 if event_type in {"turn.update", "turn.resume"}:
                     transcript = (message.get("transcript") or "").strip()
-                    if transcript:
-                        await maybe_prefetch_from_partial(session, transcript)
                     await log_event(
                         session.session_id,
                         event_type.replace(".", "_"),

@@ -13,7 +13,6 @@ from app.call_state_manager import call_state_manager
 from app.compliance import log_event, persist_call_record
 from app.orchestration import GraphState
 from app.prompts import HUMAN_REQUESTED_TWICE_PROMPT
-from app.tools.extractors import predict_intent_fast
 from app.tools.insurance import get_claim_status, get_policy_info, trigger_handoff
 from evals.llm_evals import run_post_call_evals
 from mock_data.db import ensure_pool
@@ -95,6 +94,8 @@ def schedule_response_task(session: CallState, coroutine: Any) -> None:
 
 
 async def cancel_session_tasks(session: CallState) -> None:
+    from app.app_state import get_tts
+
     tasks = [session.active_response_task, session.active_tts_task, session.speculative_task]
     session.active_response_task = None
     session.active_tts_task = None
@@ -104,6 +105,7 @@ async def cancel_session_tasks(session: CallState) -> None:
     session.last_mark = None
     session.interrupted = True
     session.response_buffer.supersede()
+    await get_tts().cancel_turn_context(session)
     for task in tasks:
         if task is not None and not task.done():
             task.cancel()
@@ -192,6 +194,7 @@ def build_sentence_handler(session: CallState):
             session,
             sentence,
             transport="twilio",
+            continue_response=True,
         )
         session.response_buffer.sentence_complete()
 
@@ -206,7 +209,7 @@ async def handle_completed_turn(
     *,
     speculative: bool,
 ) -> None:
-    from app.audio import fail_safe_handoff, send_agent_response
+    from app.audio import fail_safe_handoff, finalize_agent_response, send_agent_response
 
     try:
         if not should_process_transcript(transcript):
@@ -218,7 +221,16 @@ async def handle_completed_turn(
         result = await process_transcript(session, transcript)
         response_text = result.get("response_text") or result.get("response") or ""
         if session.twilio_websocket is not None and session.response_buffer.sentences_sent == 0 and response_text:
-            await send_agent_response(websocket, session, response_text, transport="twilio")
+            await send_agent_response(
+                websocket,
+                session,
+                response_text,
+                transport="twilio",
+                continue_response=True,
+            )
+            session.response_buffer.sentence_complete()
+        if session.twilio_websocket is not None and session.response_buffer.sentences_sent > 0:
+            await finalize_agent_response(websocket, session, transport="twilio")
         elif not response_text:
             await log_turn_outcome(session, "no_response_needed")
         session.pending_transcript = None
@@ -247,25 +259,3 @@ async def interrupt_twilio_playback(websocket: WebSocket, session: CallState) ->
         await send_clear_to_twilio(websocket, session)
         logger.info("BARGE_IN [%s] cleared Twilio buffer", session.session_id)
     await cancel_session_tasks(session)
-
-
-async def maybe_prefetch_from_partial(session: CallState, transcript: str) -> None:
-    if not session.verified:
-        return
-    if len(transcript.split()) < 4:
-        return
-    intent = predict_intent_fast(transcript)
-    if intent is None or intent in session.prefetched_data or intent in session.prefetch_tasks:
-        return
-
-    async def _prefetch_result() -> None:
-        try:
-            if intent == "get_claim_status":
-                result = await get_claim_status(session.session_id, session.policy_number or "")
-            else:
-                result = await get_policy_info(session.session_id, session.policy_number or "")
-            session.prefetched_data[intent] = result
-        finally:
-            session.prefetch_tasks.pop(intent, None)
-
-    session.prefetch_tasks[intent] = asyncio.create_task(_prefetch_result())

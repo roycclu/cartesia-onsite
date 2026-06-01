@@ -14,72 +14,141 @@ logger = logging.getLogger("voice_agent")
 
 
 @dataclass
-class CallState:
-    call_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    session_id: str | None = None
-    call_sid: str | None = None
-    stream_sid: str | None = None
-
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    ended_at: Optional[datetime] = None
-
+class ConversationState:
     verified: bool = False
     policy_number: Optional[str] = None
     ssn_last4: Optional[str] = None
-    last_verification_failed: bool = False
     holder_name: Optional[str] = None
     verification_attempts: int = 0
-    post_verification_greeted: bool = False
-    name_acknowledged: bool = False
-
-    history: list[dict[str, str]] = field(default_factory=list)
     pending_intent: Optional[str] = None
     pending_intent_transcript: Optional[str] = None
     answered_queries: dict[str, dict[str, Any]] = field(default_factory=dict)
     latest_tool_result: dict[str, Any] | None = None
-    turn_count: int = 0
-    human_requests: int = 0
-
     should_handoff: bool = False
     handoff_reason: Optional[str] = None
     should_close: bool = False
     resolved: bool = False
+    name_acknowledged: bool = False
+    history: list[dict[str, str]] = field(default_factory=list)
+    turn_count: int = 0
+    human_requests: int = 0
 
-    prompt_version: str | None = None
-    call_summary: Optional[dict[str, Any]] = None
-    eval_pii_safety: int | None = None
-    eval_intent_acknowledgment: int | None = None
 
+@dataclass
+class SessionRuntime:
+    session_id: str | None = None
+    call_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    call_sid: str | None = None
+    stream_sid: str | None = None
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    ended_at: Optional[datetime] = None
+    twilio_websocket: Any = field(default=None, repr=False)
     twilio_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-    tts_playing: bool = False
-    last_mark: str | None = None
+    ink_stream: Any = field(default=None, repr=False)
     active_response_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     active_tts_task: asyncio.Task[Any] | None = field(default=None, repr=False)
-    pending_transcript: str | None = None
-    ink_stream: Any = field(default=None, repr=False)
     speculative_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     speculative_transcript: str | None = None
-    prefetched_data: dict[str, dict[str, Any]] = field(default_factory=dict)
-    prefetch_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict, repr=False)
-    response_buffer: ResponseBuffer = field(default_factory=ResponseBuffer, repr=False)
+    tts_playing: bool = False
+    last_mark: str | None = None
     interrupted: bool = False
-    twilio_websocket: Any = field(default=None, repr=False)
+    pending_transcript: str | None = None
+    current_tts_context_id: str | None = None
+    current_tts_ws: Any = field(default=None, repr=False)
+    current_tts_reader_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    current_tts_open: bool = False
+    current_tts_finalized: bool = False
+    current_tts_has_input: bool = False
+    response_buffer: ResponseBuffer = field(default_factory=ResponseBuffer, repr=False)
     current_turn_id: str | None = None
     current_turn_end_latency_t0: float | None = None
     current_turn_response_started_logged: bool = False
     current_turn_outcome: str | None = None
 
+
+@dataclass
+class CallState:
+    conversation: ConversationState = field(default_factory=ConversationState)
+    runtime: SessionRuntime = field(default_factory=SessionRuntime)
+    prompt_version: str | None = None
+    call_summary: Optional[dict[str, Any]] = None
+    eval_pii_safety: int | None = None
+    eval_intent_acknowledgment: int | None = None
+
+    _CONVERSATION_FIELDS = {
+        "verified",
+        "policy_number",
+        "ssn_last4",
+        "holder_name",
+        "verification_attempts",
+        "pending_intent",
+        "pending_intent_transcript",
+        "answered_queries",
+        "latest_tool_result",
+        "should_handoff",
+        "handoff_reason",
+        "should_close",
+        "resolved",
+        "name_acknowledged",
+        "history",
+        "turn_count",
+        "human_requests",
+    }
+    _RUNTIME_FIELDS = {
+        "session_id",
+        "call_id",
+        "call_sid",
+        "stream_sid",
+        "started_at",
+        "ended_at",
+        "twilio_websocket",
+        "twilio_send_lock",
+        "ink_stream",
+        "active_response_task",
+        "active_tts_task",
+        "speculative_task",
+        "speculative_transcript",
+        "tts_playing",
+        "last_mark",
+        "interrupted",
+        "pending_transcript",
+        "current_tts_context_id",
+        "current_tts_ws",
+        "current_tts_reader_task",
+        "current_tts_open",
+        "current_tts_finalized",
+        "current_tts_has_input",
+        "response_buffer",
+        "current_turn_id",
+        "current_turn_end_latency_t0",
+        "current_turn_response_started_logged",
+        "current_turn_outcome",
+    }
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._CONVERSATION_FIELDS:
+            return getattr(self.conversation, name)
+        if name in self._RUNTIME_FIELDS:
+            return getattr(self.runtime, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"conversation", "runtime", "prompt_version", "call_summary", "eval_pii_safety", "eval_intent_acknowledgment", "_CONVERSATION_FIELDS", "_RUNTIME_FIELDS"}:
+            object.__setattr__(self, name, value)
+            return
+        if "conversation" in self.__dict__ and name in self._CONVERSATION_FIELDS:
+            setattr(self.conversation, name, value)
+            return
+        if "runtime" in self.__dict__ and name in self._RUNTIME_FIELDS:
+            setattr(self.runtime, name, value)
+            return
+        object.__setattr__(self, name, value)
+
     def merge_extracted_fields(self, extracted: dict[str, Any]) -> None:
-        if extracted.get("policy_number") and not self.policy_number:
+        if extracted.get("policy_number"):
             self.policy_number = extracted["policy_number"]
-        new_ssn = extracted.get("ssn_last4")
-        if new_ssn:
-            if not self.ssn_last4:
-                self.ssn_last4 = new_ssn
-            elif self.last_verification_failed:
-                self.ssn_last4 = new_ssn
-                self.last_verification_failed = False
-                logger.info("SSN_UPDATED replacing failed SSN with new value")
+        if extracted.get("ssn_last4"):
+            self.ssn_last4 = extracted["ssn_last4"]
 
     def capture_pending_intent(self, intent: str, transcript: str) -> None:
         if not self.verified and intent not in ("verify_identity", "unknown"):
@@ -98,7 +167,6 @@ class CallState:
         self.latest_tool_result = result
 
     def mark_verification_failed(self) -> None:
-        self.last_verification_failed = True
         self.ssn_last4 = None
         self.verification_attempts += 1
 
