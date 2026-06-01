@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -80,18 +81,26 @@ class LLMHelper:
             logger.warning("LLM_MISSING_MAX_TOKENS caller=%s", caller)
 
     async def classify_intent(self, transcript: str) -> Intent:
+        t0 = time.monotonic()
         lowered = transcript.lower()
         if any(phrase in lowered for phrase in ("that's all", "that is all", "all set", "no that's it", "no that is it")):
-            return "end_conversation"
+            intent = "end_conversation"
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
+            return intent
         if any(phrase in lowered for phrase in ("representative", "human", "agent")):
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "handoff"
         if any(phrase in lowered for phrase in ("update my", "change my", "file a claim", "cancel my policy", "pay my bill")):
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "write_request"
         if any(phrase in lowered for phrase in ("weather", "sports", "restaurant", "flight")):
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "out_of_scope"
         if "claim" in lowered or "status" in lowered:
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "get_claim_status"
         if "policy" in lowered or "coverage" in lowered or "deductible" in lowered:
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "get_policy_info"
         prompt = INTENT_CLASSIFICATION_PROMPT.format(transcript=transcript)
         try:
@@ -100,8 +109,10 @@ class LLMHelper:
             async with asyncio.timeout(self.timeout_seconds):
                 response = await self.client.responses.create(**params)
             text = (response.output_text or "unknown").strip().split()[0]
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return text if text in ALLOWED_INTENTS else "unknown"
         except Exception:
+            logger.info("TIMING intent_ms=%.0f", (time.monotonic() - t0) * 1000)
             return "unknown"
 
     async def generate_greeting(self) -> str:
@@ -199,6 +210,8 @@ class LLMHelper:
             self._validate_llm_params(params, "stream_response")
             parts: list[str] = []
             chunk_buffer = ""
+            llm_t0 = time.monotonic()
+            first_token_logged = False
             stream = await self.client.chat.completions.create(**params)
             while True:
                 try:
@@ -209,6 +222,9 @@ class LLMHelper:
                 delta = chunk.choices[0].delta.content or ""
                 if not delta:
                     continue
+                if not first_token_logged:
+                    logger.info("TIMING llm_first_token_ms=%.0f", (time.monotonic() - llm_t0) * 1000)
+                    first_token_logged = True
                 parts.append(delta)
                 chunk_buffer += delta
                 chunks, chunk_buffer = split_speakable_chunks(chunk_buffer)
@@ -317,7 +333,9 @@ class InsuranceOrchestrator:
 
     async def _verify_or_gate(self, state: GraphState) -> GraphState:
         call_state = state["call_state"]
+        extraction_t0 = time.monotonic()
         extracted = extract_fields(state["transcript"])
+        logger.info("TIMING extraction_ms=%.0f", (time.monotonic() - extraction_t0) * 1000)
         call_state.merge_extracted_fields(extracted)
         logger.info(
             "EXTRACT [%s] raw_transcript=%r extracted_policy=%r extracted_ssn=%r",
@@ -499,6 +517,17 @@ class InsuranceOrchestrator:
             call_state.latest_tool_result = state["tool_result"]
             return state
 
+        if (
+            call_state.speculative_tool_turn_id == call_state.current_turn_id
+            and call_state.speculative_intent == intent
+            and call_state.speculative_tool_result is not None
+        ):
+            logger.info("PREFETCH [%s] intent=%s hit=true", state["session_id"], intent)
+            call_state.record_answered_query(intent, call_state.speculative_tool_result)
+            state["tool_result"] = call_state.speculative_tool_result
+            return state
+
+        tool_t0 = time.monotonic()
         if intent == "get_claim_status":
             result = await get_claim_status(state["session_id"], call_state.policy_number or "")
             call_state.record_answered_query(intent, result)
@@ -509,7 +538,27 @@ class InsuranceOrchestrator:
             state["tool_result"] = result
         else:
             state["tool_result"] = {"message": "verified"}
+        if intent in {"get_claim_status", "get_policy_info"}:
+            logger.info("TIMING tool_ms=%.0f", (time.monotonic() - tool_t0) * 1000)
         return state
+
+    def _structured_response_chunks(self, intent: Intent, result: dict[str, Any]) -> list[str] | None:
+        if "error" in result:
+            return [result["error"]]
+        if intent == "get_claim_status" and {"status", "last_updated", "adjuster_name"} <= result.keys():
+            date_text = str(result["last_updated"]).split("T")[0]
+            return [
+                f"Your claim is {result['status']}.",
+                f"It was last updated on {date_text} with {result['adjuster_name']}.",
+            ]
+        if intent == "get_policy_info" and {"coverage_type", "coverage_limit", "deductible", "effective_date"} <= result.keys():
+            limit = f"${int(result['coverage_limit']):,}"
+            deductible = f"${int(result['deductible']):,}"
+            return [
+                f"Your policy is {result['coverage_type']}.",
+                f"It has a {limit} limit and a {deductible} deductible, effective {result['effective_date']}.",
+            ]
+        return None
 
     async def _generate_response(self, state: GraphState) -> GraphState:
         logger.info(
@@ -518,8 +567,18 @@ class InsuranceOrchestrator:
             state["call_state"].verified,
             state["call_state"].verified,
         )
+        intent = state.get("intent")
+        tool_result = state.get("tool_result") or {}
+        structured_chunks = None
+        if intent in {"get_claim_status", "get_policy_info"} and not state.get("repeated_query"):
+            structured_chunks = self._structured_response_chunks(intent, tool_result)
         sentence_handler = state.get("sentence_handler")
-        if sentence_handler is not None:
+        if structured_chunks is not None:
+            if sentence_handler is not None:
+                for chunk in structured_chunks:
+                    await sentence_handler(chunk)
+            response = " ".join(chunk.strip() for chunk in structured_chunks if chunk.strip())
+        elif sentence_handler is not None:
             response = await self.llm.stream_response(state, sentence_handler)
         else:
             response = await self.llm.generate_response(state)

@@ -13,6 +13,7 @@ from app.call_state_manager import call_state_manager
 from app.compliance import log_event, persist_call_record
 from app.orchestration import GraphState
 from app.prompts import HUMAN_REQUESTED_TWICE_PROMPT
+from app.tools.extractors import predict_intent_fast
 from app.tools.insurance import get_claim_status, get_policy_info, trigger_handoff
 from evals.llm_evals import run_post_call_evals
 from mock_data.db import ensure_pool
@@ -96,10 +97,14 @@ def schedule_response_task(session: CallState, coroutine: Any) -> None:
 async def cancel_session_tasks(session: CallState) -> None:
     from app.app_state import get_tts
 
-    tasks = [session.active_response_task, session.active_tts_task, session.speculative_task]
+    tasks = [session.active_response_task, session.active_tts_task, session.speculative_task, session.speculative_tool_task]
     session.active_response_task = None
     session.active_tts_task = None
     session.speculative_task = None
+    session.speculative_tool_task = None
+    session.speculative_tool_result = None
+    session.speculative_tool_turn_id = None
+    session.speculative_intent = None
     session.pending_transcript = None
     session.tts_playing = False
     session.last_mark = None
@@ -142,6 +147,45 @@ def start_speculative_task(session: CallState, websocket: WebSocket, transcript:
             session.speculative_task = None
 
     task.add_done_callback(_clear_speculative)
+
+
+def maybe_prefetch_from_partial(session: CallState, transcript: str) -> None:
+    if not session.verified or session.current_turn_id is None:
+        return
+    if len(transcript.split()) < 4:
+        return
+    intent = predict_intent_fast(transcript)
+    if intent not in {"get_claim_status", "get_policy_info"}:
+        return
+    if session.speculative_intent == intent and (
+        session.speculative_tool_result is not None
+        or (session.speculative_tool_task is not None and not session.speculative_tool_task.done())
+    ):
+        return
+    if session.speculative_tool_task is not None and not session.speculative_tool_task.done():
+        session.speculative_tool_task.cancel()
+    session.speculative_intent = intent
+    session.speculative_tool_result = None
+    session.speculative_tool_turn_id = session.current_turn_id
+    turn_id = session.current_turn_id
+
+    async def _prefetch_result() -> None:
+        try:
+            if intent == "get_claim_status":
+                result = await get_claim_status(session.session_id, session.policy_number or "")
+            else:
+                result = await get_policy_info(session.session_id, session.policy_number or "")
+            if session.current_turn_id == turn_id and session.speculative_intent == intent:
+                session.speculative_tool_result = result
+                logger.info("PREFETCH [%s] intent=%s ready=true", session.session_id, intent)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if session.speculative_tool_task is asyncio.current_task():
+                session.speculative_tool_task = None
+
+    logger.info("PREFETCH [%s] intent=%s ready=false", session.session_id, intent)
+    session.speculative_tool_task = asyncio.create_task(_prefetch_result())
 
 
 async def resolve_speculative_turn(session: CallState, websocket: WebSocket, transcript: str) -> bool:

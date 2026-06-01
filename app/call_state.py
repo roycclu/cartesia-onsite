@@ -48,6 +48,10 @@ class SessionRuntime:
     active_tts_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     speculative_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     speculative_transcript: str | None = None
+    speculative_intent: str | None = None
+    speculative_tool_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    speculative_tool_result: dict[str, Any] | None = None
+    speculative_tool_turn_id: str | None = None
     tts_playing: bool = False
     last_mark: str | None = None
     interrupted: bool = False
@@ -106,6 +110,10 @@ class CallState:
         "active_tts_task",
         "speculative_task",
         "speculative_transcript",
+        "speculative_intent",
+        "speculative_tool_task",
+        "speculative_tool_result",
+        "speculative_tool_turn_id",
         "tts_playing",
         "last_mark",
         "interrupted",
@@ -154,10 +162,15 @@ class CallState:
             self.pending_intent_transcript = transcript
 
     def start_new_turn(self) -> str:
+        if self.speculative_tool_task is not None and not self.speculative_tool_task.done():
+            self.speculative_tool_task.cancel()
         self.current_turn_id = str(uuid.uuid4())[:8]
         self.current_turn_end_latency_t0 = None
         self.current_turn_response_started_logged = False
         self.current_turn_outcome = None
+        self.speculative_intent = None
+        self.speculative_tool_result = None
+        self.speculative_tool_turn_id = None
         return self.current_turn_id
 
     def record_answered_query(self, query_type: str, result: dict[str, Any]) -> None:
