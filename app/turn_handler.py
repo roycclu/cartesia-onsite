@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -20,10 +21,52 @@ from mock_data.db import ensure_pool
 
 logger = logging.getLogger("voice_agent")
 
+ACKNOWLEDGMENT_PHRASES = {
+    "okay",
+    "ok",
+    "okay thanks",
+    "ok thanks",
+    "thanks",
+    "thank you",
+    "sure",
+    "got it",
+    "alright",
+    "sounds good",
+}
+
 
 def should_process_transcript(transcript: str) -> bool:
     cleaned = transcript.strip().strip(".,!?")
     return len(cleaned) >= 3
+
+
+def should_speculate_on_transcript(transcript: str) -> bool:
+    cleaned = transcript.strip().strip(".,!?").lower()
+    if len(cleaned) < 3:
+        return False
+    if cleaned in ACKNOWLEDGMENT_PHRASES:
+        return False
+    words = re.findall(r"[a-z0-9']+", cleaned)
+    if len(words) >= 5:
+        return True
+    if predict_intent_fast(transcript) in {"get_claim_status", "get_policy_info"}:
+        return True
+    if "policy" in cleaned or "social" in cleaned or "ssn" in cleaned:
+        return True
+    digit_count = sum(char.isdigit() for char in cleaned)
+    return digit_count >= 4
+
+
+def is_benign_turn_exception(session: CallState, exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "context closed" not in message:
+        return False
+    return bool(
+        session.interrupted
+        or session.response_buffer.superseded
+        or session.ended_at is not None
+        or session.should_close
+    )
 
 
 async def log_turn_outcome(session: CallState, outcome: str) -> None:
@@ -282,7 +325,12 @@ async def handle_completed_turn(
         if session.should_close:
             await finalize_call(session, resolved=session.resolved)
             await websocket.close(code=1000)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
+        if is_benign_turn_exception(session, exc):
+            logger.info("TURN_SUPPRESSED [%s] benign_exception=%s", session.session_id, exc)
+            return
         logger.error("TURN_ERROR [%s] %s", session.session_id, exc)
         await log_turn_outcome(session, "error")
         await fail_safe_handoff(websocket, session, "system_error")

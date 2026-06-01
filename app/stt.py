@@ -20,6 +20,7 @@ from app.turn_handler import (
     resolve_speculative_turn,
     schedule_response_task,
     should_process_transcript,
+    should_speculate_on_transcript,
     start_speculative_task,
 )
 
@@ -117,7 +118,7 @@ class CartesiaTranscriber:
                     continue
                 if event_type == "turn.eager_end":
                     transcript = (message.get("transcript") or "").strip()
-                    if transcript and should_process_transcript(transcript):
+                    if transcript and should_speculate_on_transcript(transcript):
                         session.pending_transcript = transcript
                         start_speculative_task(session, twilio_ws, transcript, time.time())
                     continue

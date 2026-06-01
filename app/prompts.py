@@ -42,6 +42,7 @@ HUMAN_HANDOFF_PROMPT = "I’m transferring you to a human representative for fur
 HUMAN_REQUESTED_TWICE_PROMPT = "I’m connecting you with a human representative now."
 LLM_ERROR_PROMPT = "I’m having trouble completing that request. I’ll connect you with a human representative."
 UNKNOWN_REQUEST_PROMPT = "That request is outside this insurance support demo, so I’m transferring you to a human representative."
+UNKNOWN_CLARIFICATION_PROMPT = "I can help with claim status or policy details. What would you like to know?"
 WRITE_REQUEST_PROMPT = "I can’t make account changes in this demo, so I’m connecting you with a human representative."
 END_CONVERSATION_PROMPT = "That’s everything I needed. Thanks for calling, and have a good day."
 REPEATED_QUERY_INSTRUCTION = "The caller already received this answer earlier in the call. Respond briefly with 'As I mentioned' and restate the answer without calling any tools again."

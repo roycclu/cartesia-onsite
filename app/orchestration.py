@@ -20,6 +20,7 @@ from app.prompts import (
     PROMPT_VERSION,
     REPEATED_QUERY_INSTRUCTION,
     SYSTEM_PROMPT_VERIFIED,
+    UNKNOWN_CLARIFICATION_PROMPT,
     UNKNOWN_REQUEST_PROMPT,
     VERIFICATION_FAILED_HANDOFF_PROMPT,
     VERIFICATION_PROMPT,
@@ -288,6 +289,8 @@ class LLMHelper:
                 f"Your policy is {result['coverage_type']} with a coverage limit of {result['coverage_limit']} dollars "
                 f"and a deductible of {result['deductible']} dollars."
             )
+        if intent == "unknown" and call_state.verified:
+            return UNKNOWN_CLARIFICATION_PROMPT
         if call_state.verified:
             return self._fallback_verification_success(None, None)
         return self._fallback_verification_prompt(call_state.verification_attempts)
@@ -494,7 +497,7 @@ class InsuranceOrchestrator:
                 )
             return state
 
-        if intent in {"write_request", "unknown"}:
+        if intent == "write_request":
             call_state.should_handoff = True
             call_state.handoff_reason = intent
             should_log_handoff = call_state.current_turn_outcome is None
@@ -509,6 +512,11 @@ class InsuranceOrchestrator:
                     "turn_outcome",
                     {"turn_id": call_state.current_turn_id, "outcome": "handoff", "reason": intent},
                 )
+            return state
+
+        if intent == "unknown":
+            state["tool_result"] = {"message": UNKNOWN_CLARIFICATION_PROMPT}
+            state["response_text"] = UNKNOWN_CLARIFICATION_PROMPT
             return state
 
         if not call_state.verified:
