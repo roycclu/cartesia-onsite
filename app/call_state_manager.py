@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from app.call_state import CallState
+from app.call_state import CallState, SessionRuntime
 from app.pii import mask_policy
 
 logger = logging.getLogger("voice_agent")
@@ -14,7 +14,7 @@ class CallStateManager:
         self._active_calls: dict[str, CallState] = {}
 
     def create(self, session_id: str, call_sid: str | None) -> CallState:
-        state = CallState(session_id=session_id, call_sid=call_sid)
+        state = CallState(runtime=SessionRuntime(session_id=session_id, call_sid=call_sid))
         self._active_calls[session_id] = state
         logger.info("CALL_START call_id=%s session_id=%s", state.call_id, session_id)
         return state
