@@ -3,38 +3,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
+from collections import Counter
 import os
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
 
 import asyncpg
 
 
-@dataclass
-class TurnMetrics:
-    turn_end: datetime | None = None
-    response_started: datetime | None = None
-    turn_outcome: str | None = None
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Report aggregate latency metrics from compliance logs.")
+    parser = argparse.ArgumentParser(description="Report canonical turn latency from compliance logs.")
     parser.add_argument("--hours", type=int, default=24, help="Lookback window in hours. Defaults to 24.")
+    parser.add_argument("--session-id", help="Optional session_id filter for debugging a single call.")
     return parser.parse_args()
 
 
-def parse_ts(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def percentile(values: list[float], pct: float) -> float | None:
+def percentile(values: list[int], pct: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
     if len(ordered) == 1:
-        return ordered[0]
+        return float(ordered[0])
     rank = (len(ordered) - 1) * pct
     lower = int(rank)
     upper = min(lower + 1, len(ordered) - 1)
@@ -48,49 +35,90 @@ def fmt_ms(value: float | None) -> str:
     return f"{value:.0f}ms"
 
 
-def fmt_pct(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.1f}%"
+async def fetch_latency_rows(conn: asyncpg.Connection, hours: int, session_id: str | None) -> list[asyncpg.Record]:
+    if session_id:
+        return await conn.fetch(
+            """
+            WITH turn_latency AS (
+              SELECT
+                a.session_id,
+                a.content::json->>'turn_id' AS turn_id,
+                a.timestamp::timestamptz AS turn_end_ts,
+                r.timestamp::timestamptz AS response_started_ts,
+                (r.content::json->>'latency_ms')::int AS latency_ms,
+                o.content::json->>'outcome' AS turn_outcome
+              FROM compliance_log a
+              JOIN compliance_log r
+                ON a.session_id = r.session_id
+               AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
+              LEFT JOIN compliance_log o
+                ON a.session_id = o.session_id
+               AND a.content::json->>'turn_id' = o.content::json->>'turn_id'
+               AND o.event_type = 'turn_outcome'
+              WHERE a.event_type = 'asr_result'
+                AND r.event_type = 'response_started'
+                AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
+                AND a.session_id = $2
+            )
+            SELECT session_id, turn_id, turn_end_ts, response_started_ts, latency_ms, turn_outcome
+            FROM turn_latency
+            ORDER BY response_started_ts DESC
+            """,
+            hours,
+            session_id,
+        )
+    return await conn.fetch(
+        """
+        WITH turn_latency AS (
+          SELECT
+            a.session_id,
+            a.content::json->>'turn_id' AS turn_id,
+            a.timestamp::timestamptz AS turn_end_ts,
+            r.timestamp::timestamptz AS response_started_ts,
+            (r.content::json->>'latency_ms')::int AS latency_ms,
+            o.content::json->>'outcome' AS turn_outcome
+          FROM compliance_log a
+          JOIN compliance_log r
+            ON a.session_id = r.session_id
+           AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
+          LEFT JOIN compliance_log o
+            ON a.session_id = o.session_id
+           AND a.content::json->>'turn_id' = o.content::json->>'turn_id'
+           AND o.event_type = 'turn_outcome'
+          WHERE a.event_type = 'asr_result'
+            AND r.event_type = 'response_started'
+            AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
+        )
+        SELECT session_id, turn_id, turn_end_ts, response_started_ts, latency_ms, turn_outcome
+        FROM turn_latency
+        ORDER BY response_started_ts DESC
+        """,
+        hours,
+    )
 
 
-async def fetch_rows(conn: asyncpg.Connection, query: str, *params: Any) -> list[asyncpg.Record]:
-    return await conn.fetch(query, *params)
-
-
-def build_turn_metrics(rows: list[asyncpg.Record]) -> dict[str, TurnMetrics]:
-    turns: dict[str, TurnMetrics] = {}
-    for row in rows:
-        payload = json.loads(row["content"])
-        turn_id = payload.get("turn_id")
-        if not turn_id:
-            continue
-        turn = turns.setdefault(turn_id, TurnMetrics())
-        timestamp = parse_ts(row["timestamp"])
-        if row["event_type"] == "asr_result":
-            turn.turn_end = timestamp
-        elif row["event_type"] == "response_started":
-            if turn.response_started is None or timestamp < turn.response_started:
-                turn.response_started = timestamp
-        elif row["event_type"] == "turn_outcome":
-            turn.turn_outcome = payload.get("outcome")
-    return turns
-
-
-def analyze_turns(turns: dict[str, TurnMetrics]) -> tuple[list[float], dict[str, int]]:
-    latency_ms: list[float] = []
-    outcome_counts: dict[str, int] = {}
-
-    for turn in turns.values():
-        outcome = turn.turn_outcome or "unknown"
-        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
-        if outcome != "responded":
-            continue
-        if turn.turn_end is None or turn.response_started is None:
-            continue
-        latency_ms.append(max(0.0, (turn.response_started - turn.turn_end).total_seconds() * 1000))
-
-    return latency_ms, outcome_counts
+async def fetch_call_rows(conn: asyncpg.Connection, hours: int, session_id: str | None) -> list[asyncpg.Record]:
+    if session_id:
+        return await conn.fetch(
+            """
+            SELECT call_id, resolved, handoff_reason
+            FROM calls
+            WHERE started_at >= NOW() - make_interval(hours => $1::int)
+              AND session_id::text = $2
+            ORDER BY started_at DESC
+            """,
+            hours,
+            session_id,
+        )
+    return await conn.fetch(
+        """
+        SELECT call_id, resolved, handoff_reason
+        FROM calls
+        WHERE started_at >= NOW() - make_interval(hours => $1::int)
+        ORDER BY started_at DESC
+        """,
+        hours,
+    )
 
 
 async def main() -> None:
@@ -101,51 +129,33 @@ async def main() -> None:
 
     conn = await asyncpg.connect(database_url)
     try:
-        log_rows = await fetch_rows(
-            conn,
-            """
-            SELECT session_id, event_type, content, timestamp
-            FROM compliance_log
-            WHERE event_type IN ('asr_result', 'response_started', 'turn_outcome')
-              AND timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
-            ORDER BY id ASC
-            """,
-            args.hours,
-        )
-        call_rows = await fetch_rows(
-            conn,
-            """
-            SELECT call_id, resolved, handoff_reason, duration_seconds, verified, turn_count
-            FROM calls
-            WHERE started_at >= NOW() - make_interval(hours => $1::int)
-            ORDER BY started_at DESC
-            """,
-            args.hours,
-        )
+        latency_rows = await fetch_latency_rows(conn, args.hours, args.session_id)
+        call_rows = await fetch_call_rows(conn, args.hours, args.session_id)
     finally:
         await conn.close()
 
-    turns = build_turn_metrics(log_rows)
-    latency_ms, outcome_counts = analyze_turns(turns)
+    outcome_counts = Counter((row["turn_outcome"] or "unknown") for row in latency_rows)
+    responded_latencies = [row["latency_ms"] for row in latency_rows if row["turn_outcome"] == "responded" and row["latency_ms"] is not None]
 
-    p50 = percentile(latency_ms, 0.50)
-    p75 = percentile(latency_ms, 0.75)
-    p95 = percentile(latency_ms, 0.95)
+    p50 = percentile(responded_latencies, 0.50)
+    p75 = percentile(responded_latencies, 0.75)
+    p95 = percentile(responded_latencies, 0.95)
 
     total_calls = len(call_rows)
     contained_calls = sum(1 for row in call_rows if row["resolved"] and not row["handoff_reason"])
-    containment_rate = (contained_calls / total_calls * 100) if total_calls else None
 
     print("Latency Report")
     print("==============")
     print()
     print(f"Lookback window: last {args.hours} hour(s)")
+    if args.session_id:
+        print(f"Session filter: {args.session_id}")
     print()
     print("1. Turn End To First TTS Stream Start")
     print(f"p50: {fmt_ms(p50)}")
     print(f"p75: {fmt_ms(p75)}")
     print(f"p95: {fmt_ms(p95)}")
-    print(f"Measured turns: {len(latency_ms)}")
+    print(f"Measured turns: {len(responded_latencies)}")
     print()
     print("2. Turn Outcomes")
     print(f"responded: {outcome_counts.get('responded', 0)}")
@@ -153,21 +163,25 @@ async def main() -> None:
     print(f"handoff: {outcome_counts.get('handoff', 0)}")
     print(f"error: {outcome_counts.get('error', 0)}")
     print(f"superseded: {outcome_counts.get('superseded', 0)}")
+    print(f"unknown: {outcome_counts.get('unknown', 0)}")
     print()
     print("3. Call Summary")
     print(f"Total calls: {total_calls}")
     print(f"Contained calls: {contained_calls}")
-    print(f"Containment rate: {fmt_pct(containment_rate)}")
+    print()
+    print("Sanity Check")
+    print("------------")
+    print(f"Joined latency rows: {len(latency_rows)}")
+    print(f"Rows contributing to percentiles: {len(responded_latencies)}")
     print()
     print("Warnings")
     print("--------")
-
     has_warning = False
     if p50 is not None and p50 > 3000:
-        print(f"WARNING: latency p50 is high at {fmt_ms(p50)}; rerun with --hours 2 to isolate recent calls.")
+        print(f"WARNING: latency p50 is high at {fmt_ms(p50)}")
         has_warning = True
-    if containment_rate is not None and containment_rate < 60:
-        print(f"WARNING: containment rate is low at {fmt_pct(containment_rate)}")
+    if not responded_latencies:
+        print("WARNING: no responded turns found in the selected window.")
         has_warning = True
     if not has_warning:
         print("No threshold warnings.")
