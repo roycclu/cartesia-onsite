@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import audioop
 import base64
 import json
 import logging
@@ -26,6 +25,7 @@ TWILIO_FRAME_SIZE = 160
 TWILIO_FRAME_PACE_SECONDS = 0.018
 
 
+# Manages a single streaming TTS context for the active caller turn.
 class CartesiaTTS:
     def __init__(self) -> None:
         self.api_key = config.CARTESIA_API_KEY
@@ -77,7 +77,7 @@ class CartesiaTTS:
             "voice": {"mode": "id", "id": self.voice_id},
             "language": "en",
             "context_id": context_id,
-            "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 8000},
+            "output_format": {"container": "raw", "encoding": "pcm_mulaw", "sample_rate": 8000},
             "continue": continue_response,
         }
         await session.current_tts_ws.send(json.dumps(payload))
@@ -96,7 +96,7 @@ class CartesiaTTS:
                 "voice": {"mode": "id", "id": self.voice_id},
                 "language": "en",
                 "context_id": session.current_tts_context_id,
-                "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": 8000},
+                "output_format": {"container": "raw", "encoding": "pcm_mulaw", "sample_rate": 8000},
                 "continue": False,
             }
             await session.current_tts_ws.send(json.dumps(payload))
@@ -151,8 +151,8 @@ class CartesiaTTS:
                     message = json.loads(raw)
                     message_type = message.get("type")
                     if message_type == "chunk":
-                        pcm_chunk = base64.b64decode(message["data"])
-                        mulaw_buffer.extend(audioop.lin2ulaw(pcm_chunk, 2))
+                        mulaw_chunk = base64.b64decode(message["data"])
+                        mulaw_buffer.extend(mulaw_chunk)
                         first_audio_logged = await send_audio_to_twilio(
                             websocket,
                             session,
@@ -260,6 +260,7 @@ async def log_response_started(session: CallState) -> None:
         )
 
 
+    # Streams a partial assistant response into the active TTS turn context.
 async def stream_twilio_response(
     websocket: WebSocket,
     session: CallState,
@@ -324,6 +325,7 @@ async def handle_tts_unavailable(websocket: WebSocket, session: CallState) -> No
         logger.info("tts_unavailable_socket_closed session_id=%s stream_sid=%s", session.session_id, session.stream_sid)
 
 
+    # Falls back to a human handoff when audio or turn processing cannot recover safely.
 async def fail_safe_handoff(websocket: WebSocket, session: CallState, reason: str) -> None:
     payload = await trigger_handoff(session.session_id, reason, "Automatic fallback handoff")
     session.should_handoff = True
