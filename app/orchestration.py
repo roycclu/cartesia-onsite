@@ -17,15 +17,13 @@ from app.prompts import (
     GREETING_PROMPT,
     INTENT_CLASSIFICATION_PROMPT,
     LLM_ERROR_PROMPT,
+    JUST_VERIFIED_INSTRUCTION,
     PROMPT_VERSION,
     REPEATED_QUERY_INSTRUCTION,
     SYSTEM_PROMPT_VERIFIED,
     UNKNOWN_CLARIFICATION_PROMPT,
-    UNKNOWN_REQUEST_PROMPT,
     VERIFICATION_FAILED_HANDOFF_PROMPT,
     VERIFICATION_PROMPT,
-    VERIFICATION_SUCCESS_PROMPT,
-    VERIFICATION_SUCCESS_WITH_PENDING,
     WRITE_REQUEST_PROMPT,
 )
 from app.tools.extractors import extract_fields
@@ -54,6 +52,7 @@ Intent = Literal[
 ]
 
 
+# Carries the per-turn graph state between verification, tools, and response generation.
 class GraphState(TypedDict, total=False):
     session_id: str
     transcript: str
@@ -65,9 +64,11 @@ class GraphState(TypedDict, total=False):
     handoff_reason: str | None
     llm_error: str | None
     repeated_query: bool
+    just_verified: bool
     sentence_handler: Callable[[str], Awaitable[None]]
 
 
+# Wraps the small set of LLM calls used for classification and final phrasing.
 class LLMHelper:
     def __init__(self) -> None:
         self.model = config.OPENAI_MODEL
@@ -143,30 +144,14 @@ class LLMHelper:
         except Exception:
             return self._fallback_verification_prompt(attempts)
 
-    async def generate_verification_success(self, holder_name: str | None, pending_intent: str | None = None) -> str:
-        if pending_intent:
-            prompt = VERIFICATION_SUCCESS_WITH_PENDING.format(
-                holder_name=holder_name or "the caller",
-                pending_intent=pending_intent.replace("_", " "),
-            )
-        else:
-            prompt = VERIFICATION_SUCCESS_PROMPT.format(holder_name=holder_name or "the caller")
-        try:
-            params = {"model": self.model, "input": prompt, "max_output_tokens": self.max_tokens}
-            self._validate_llm_params(params, "generate_verification_success")
-            async with asyncio.timeout(self.timeout_seconds):
-                response = await self.client.responses.create(**params)
-            text = (response.output_text or "").strip()
-            return text or self._fallback_verification_success(holder_name, pending_intent)
-        except Exception:
-            return self._fallback_verification_success(holder_name, pending_intent)
-
     async def generate_response(self, state: GraphState) -> str:
         call_state = state["call_state"]
         repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
+        just_verified_instruction = f"{JUST_VERIFIED_INSTRUCTION} " if state.get("just_verified") else ""
         prompt = SYSTEM_PROMPT_VERIFIED.format(
             holder_name=(call_state.holder_name or "there").split()[0],
-            latest_tool_result=call_state.latest_tool_result or state.get("tool_result") or {},
+            latest_tool_result=state.get("tool_result") or call_state.latest_tool_result or {},
+            just_verified_instruction=just_verified_instruction,
             repeated_query_instruction=repeated_instruction,
             state=call_state.to_llm_state(),
         )
@@ -188,9 +173,11 @@ class LLMHelper:
     async def stream_response(self, state: GraphState, sentence_handler: Callable[[str], Awaitable[None]]) -> str:
         call_state = state["call_state"]
         repeated_instruction = f"{REPEATED_QUERY_INSTRUCTION} " if state.get("repeated_query") else ""
+        just_verified_instruction = f"{JUST_VERIFIED_INSTRUCTION} " if state.get("just_verified") else ""
         prompt = SYSTEM_PROMPT_VERIFIED.format(
             holder_name=(call_state.holder_name or "there").split()[0],
-            latest_tool_result=call_state.latest_tool_result or state.get("tool_result") or {},
+            latest_tool_result=state.get("tool_result") or call_state.latest_tool_result or {},
+            just_verified_instruction=just_verified_instruction,
             repeated_query_instruction=repeated_instruction,
             state=call_state.to_llm_state(),
         )
@@ -265,8 +252,6 @@ class LLMHelper:
         if call_state.should_handoff:
             if call_state.handoff_reason == "verification_failed":
                 return VERIFICATION_FAILED_HANDOFF_PROMPT
-            if call_state.handoff_reason == "unknown":
-                return UNKNOWN_REQUEST_PROMPT
             return WRITE_REQUEST_PROMPT
         if state.get("repeated_query"):
             if intent == "get_claim_status" and "claim_id" in result:
@@ -312,6 +297,7 @@ class LLMHelper:
         return "Thanks for calling Acme Insurance, how can I help you today?"
 
 
+# Coordinates the verified-call graph from identity checks through tool execution and response output.
 class InsuranceOrchestrator:
     def __init__(self) -> None:
         self.llm = LLMHelper()
@@ -339,6 +325,7 @@ class InsuranceOrchestrator:
     async def generate_greeting(self) -> str:
         return await self.llm.generate_greeting()
 
+    # Extracts verification fields and decides whether the turn can proceed into intent handling.
     async def _verify_or_gate(self, state: GraphState) -> GraphState:
         call_state = state["call_state"]
         extraction_t0 = time.monotonic()
@@ -418,6 +405,7 @@ class InsuranceOrchestrator:
             call_state.verification_attempts = 0
             pending_intent = call_state.pending_intent
             if pending_intent:
+                state["just_verified"] = True
                 state["intent"] = pending_intent
                 state["transcript"] = call_state.pending_intent_transcript or state["transcript"]
                 call_state.pending_intent = None
@@ -469,6 +457,7 @@ class InsuranceOrchestrator:
         await log_event(state["session_id"], "intent_classification", {"transcript": state["transcript"], "intent": intent})
         return state
 
+    # Routes verified intents into tools, handoff paths, or cached speculative results.
     async def _execute_tools(self, state: GraphState) -> GraphState:
         call_state = state["call_state"]
         intent = state["intent"]
@@ -577,24 +566,26 @@ class InsuranceOrchestrator:
             logger.info("TIMING tool_ms=%.0f", (time.monotonic() - tool_t0) * 1000)
         return state
 
-    def _structured_response_chunks(self, intent: Intent, result: dict[str, Any]) -> list[str] | None:
+    def _structured_response_chunks(self, intent: Intent, result: dict[str, Any], just_verified: bool = False) -> list[str] | None:
+        prefix = ["Thanks, you're verified."] if just_verified else []
         if "error" in result:
-            return [result["error"]]
+            return prefix + [result["error"]]
         if intent == "get_claim_status" and {"status", "last_updated", "adjuster_name"} <= result.keys():
             date_text = str(result["last_updated"]).split("T")[0]
-            return [
+            return prefix + [
                 f"Your claim is {result['status']}.",
                 f"It was last updated on {date_text} with {result['adjuster_name']}.",
             ]
         if intent == "get_policy_info" and {"coverage_type", "coverage_limit", "deductible", "effective_date"} <= result.keys():
             limit = f"${int(result['coverage_limit']):,}"
             deductible = f"${int(result['deductible']):,}"
-            return [
+            return prefix + [
                 f"Your policy is {result['coverage_type']}.",
                 f"It has a {limit} limit and a {deductible} deductible, effective {result['effective_date']}.",
             ]
         return None
 
+    # Turns tool results into either structured spoken chunks or the final LLM response.
     async def _generate_response(self, state: GraphState) -> GraphState:
         prebuilt_response = state.get("response_text")
         if prebuilt_response:
@@ -621,7 +612,7 @@ class InsuranceOrchestrator:
         tool_result = state.get("tool_result") or {}
         structured_chunks = None
         if intent in {"get_claim_status", "get_policy_info"} and not state.get("repeated_query"):
-            structured_chunks = self._structured_response_chunks(intent, tool_result)
+            structured_chunks = self._structured_response_chunks(intent, tool_result, just_verified=bool(state.get("just_verified")))
         sentence_handler = state.get("sentence_handler")
         if structured_chunks is not None:
             if sentence_handler is not None:

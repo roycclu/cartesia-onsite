@@ -50,7 +50,6 @@ class CartesiaTTS:
         session.current_tts_ws = tts_ws
         session.current_tts_open = True
         session.current_tts_finalized = False
-        session.current_tts_has_input = False
         session.tts_playing = True
         session.last_mark = None
         reader_task = asyncio.create_task(self._consume_turn_audio(websocket, session, tts_ws, context_id))
@@ -81,8 +80,6 @@ class CartesiaTTS:
             "continue": continue_response,
         }
         await session.current_tts_ws.send(json.dumps(payload))
-        if text:
-            session.current_tts_has_input = True
         if not continue_response:
             session.current_tts_finalized = True
 
@@ -113,7 +110,6 @@ class CartesiaTTS:
             session.current_tts_context_id = None
             session.current_tts_open = False
             session.current_tts_finalized = False
-            session.current_tts_has_input = False
             return
         if context_id:
             with suppress(Exception):
@@ -131,7 +127,6 @@ class CartesiaTTS:
         session.current_tts_context_id = None
         session.current_tts_open = False
         session.current_tts_finalized = False
-        session.current_tts_has_input = False
 
     async def _consume_turn_audio(
         self,
@@ -206,7 +201,6 @@ class CartesiaTTS:
                 session.current_tts_context_id = None
                 session.current_tts_open = False
                 session.current_tts_finalized = False
-                session.current_tts_has_input = False
             if session.active_tts_task is asyncio.current_task():
                 session.active_tts_task = None
 
@@ -237,19 +231,15 @@ async def log_response_started(session: CallState) -> None:
     if session.current_turn_id is None or session.current_turn_response_started_logged:
         return
     session.current_turn_response_started_logged = True
-    latency_ms = None
-    if session.current_turn_end_latency_t0 is not None:
-        latency_ms = max(0, int((time.time() - session.current_turn_end_latency_t0) * 1000))
     logger.info(
-        "LATENCY [%s] turn_id=%s latency_ms=%s",
+        "RESPONSE_STARTED [%s] turn_id=%s",
         session.session_id,
         session.current_turn_id,
-        latency_ms,
     )
     await log_event(
         session.session_id,
         "response_started",
-        {"turn_id": session.current_turn_id, "latency_ms": latency_ms},
+        {"turn_id": session.current_turn_id},
     )
     if session.current_turn_outcome is None:
         session.current_turn_outcome = "responded"

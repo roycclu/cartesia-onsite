@@ -40,6 +40,7 @@ def should_process_transcript(transcript: str) -> bool:
     return len(cleaned) >= 3
 
 
+# Filters eager-end partials so speculative work only starts on likely complete requests.
 def should_speculate_on_transcript(transcript: str) -> bool:
     cleaned = transcript.strip().strip(".,!?").lower()
     if len(cleaned) < 3:
@@ -80,6 +81,7 @@ async def log_turn_outcome(session: CallState, outcome: str) -> None:
     )
 
 
+# Runs the full orchestration pass for one completed user transcript.
 async def process_transcript(session: CallState, transcript: str) -> GraphState:
     await log_event(session.session_id, "user_transcript", {"text": transcript})
     if any(word in transcript.lower() for word in ("human", "representative", "agent")):
@@ -148,7 +150,6 @@ async def cancel_session_tasks(session: CallState) -> None:
     session.speculative_tool_result = None
     session.speculative_tool_turn_id = None
     session.speculative_intent = None
-    session.pending_transcript = None
     session.tts_playing = False
     session.last_mark = None
     session.interrupted = True
@@ -176,6 +177,7 @@ async def finalize_call(session: CallState, resolved: bool = False) -> None:
     asyncio.create_task(run_post_call_evals(final_state))
 
 
+# Starts speculative processing from an eager-end transcript to reduce perceived latency.
 def start_speculative_task(session: CallState, websocket: WebSocket, transcript: str, latency_t0: float) -> None:
     from app.audio import fail_safe_handoff, send_agent_response  # noqa: F401
 
@@ -231,6 +233,7 @@ def maybe_prefetch_from_partial(session: CallState, transcript: str) -> None:
     session.speculative_tool_task = asyncio.create_task(_prefetch_result())
 
 
+# Reuses or discards speculative work once the final transcript for the turn arrives.
 async def resolve_speculative_turn(session: CallState, websocket: WebSocket, transcript: str) -> bool:
     from app.audio import send_clear_to_twilio
 
@@ -242,7 +245,6 @@ async def resolve_speculative_turn(session: CallState, websocket: WebSocket, tra
     hit = similarity >= 0.80
     logger.info("SPECULATIVE [%s] similarity=%.2f outcome=%s", session.session_id, similarity, "hit" if hit else "miss")
     if hit:
-        session.pending_transcript = None
         session.speculative_transcript = None
         return True
     session.response_buffer.supersede()
@@ -256,7 +258,6 @@ async def resolve_speculative_turn(session: CallState, websocket: WebSocket, tra
     await send_clear_to_twilio(websocket, session)
     session.speculative_task = None
     session.speculative_transcript = None
-    session.pending_transcript = None
     session.interrupted = False
     await log_turn_outcome(session, "superseded")
     return False
@@ -287,6 +288,7 @@ def build_sentence_handler(session: CallState):
     return _handle_sentence
 
 
+# Executes one user turn end-to-end, including tools, streaming TTS, and cleanup.
 async def handle_completed_turn(
     session: CallState,
     websocket: WebSocket,
@@ -318,7 +320,6 @@ async def handle_completed_turn(
             await finalize_agent_response(websocket, session)
         elif not response_text:
             await log_turn_outcome(session, "no_response_needed")
-        session.pending_transcript = None
         if speculative:
             session.speculative_transcript = transcript
             session.speculative_task = asyncio.current_task()

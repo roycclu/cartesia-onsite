@@ -9,6 +9,7 @@ from app.pii import mask_policy
 logger = logging.getLogger("voice_agent")
 
 
+# Tracks the active per-call state objects for the current process.
 class CallStateManager:
     def __init__(self) -> None:
         self._active_calls: dict[str, CallState] = {}

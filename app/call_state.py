@@ -55,16 +55,13 @@ class SessionRuntime:
     tts_playing: bool = False
     last_mark: str | None = None
     interrupted: bool = False
-    pending_transcript: str | None = None
     current_tts_context_id: str | None = None
     current_tts_ws: Any = field(default=None, repr=False)
     current_tts_reader_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     current_tts_open: bool = False
     current_tts_finalized: bool = False
-    current_tts_has_input: bool = False
     response_buffer: ResponseBuffer = field(default_factory=ResponseBuffer, repr=False)
     current_turn_id: str | None = None
-    current_turn_end_latency_t0: float | None = None
     current_turn_response_started_logged: bool = False
     current_turn_outcome: str | None = None
 
@@ -117,16 +114,13 @@ class CallState:
         "tts_playing",
         "last_mark",
         "interrupted",
-        "pending_transcript",
         "current_tts_context_id",
         "current_tts_ws",
         "current_tts_reader_task",
         "current_tts_open",
         "current_tts_finalized",
-        "current_tts_has_input",
         "response_buffer",
         "current_turn_id",
-        "current_turn_end_latency_t0",
         "current_turn_response_started_logged",
         "current_turn_outcome",
     }
@@ -165,7 +159,6 @@ class CallState:
         if self.speculative_tool_task is not None and not self.speculative_tool_task.done():
             self.speculative_tool_task.cancel()
         self.current_turn_id = str(uuid.uuid4())[:8]
-        self.current_turn_end_latency_t0 = None
         self.current_turn_response_started_logged = False
         self.current_turn_outcome = None
         self.speculative_intent = None

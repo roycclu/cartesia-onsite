@@ -25,27 +25,15 @@ VERIFICATION_PROMPT = (
     "Never ask for name, date of birth, or anything else.\n"
     "Keep responses under 20 words. Sound human."
 )
-VERIFICATION_SUCCESS_PROMPT = (
-    "Caller verified as {holder_name}. "
-    "Generate a warm one-sentence greeting that uses their first name and asks how you can help. "
-    "Example style: 'Great, I've got you verified Maya — what can I help you with today?' "
-    "Keep it natural and brief."
-)
-VERIFICATION_SUCCESS_WITH_PENDING = (
-    "Caller verified as {holder_name}. "
-    "They previously indicated interest in {pending_intent}. "
-    "Generate a warm one-sentence greeting that uses their first name and naturally resumes that topic. "
-    "Keep it natural and brief."
-)
 VERIFICATION_FAILED_HANDOFF_PROMPT = "I’m transferring you to a human representative."
 HUMAN_HANDOFF_PROMPT = "I’m transferring you to a human representative for further help."
 HUMAN_REQUESTED_TWICE_PROMPT = "I’m connecting you with a human representative now."
 LLM_ERROR_PROMPT = "I’m having trouble completing that request. I’ll connect you with a human representative."
-UNKNOWN_REQUEST_PROMPT = "That request is outside this insurance support demo, so I’m transferring you to a human representative."
 UNKNOWN_CLARIFICATION_PROMPT = "I can help with claim status or policy details. What would you like to know?"
 WRITE_REQUEST_PROMPT = "I can’t make account changes in this demo, so I’m connecting you with a human representative."
 END_CONVERSATION_PROMPT = "That’s everything I needed. Thanks for calling, and have a good day."
 REPEATED_QUERY_INSTRUCTION = "The caller already received this answer earlier in the call. Respond briefly with 'As I mentioned' and restate the answer without calling any tools again."
+JUST_VERIFIED_INSTRUCTION = "Briefly acknowledge that the caller is now verified before answering."
 
 INTENT_CLASSIFICATION_PROMPT = (
     "Classify the insurance call center request into one of: "
@@ -68,6 +56,7 @@ SYSTEM_PROMPT_VERIFIED = (
     "- Sound warm and human\n"
     "- Never repeat the policy number back to them\n"
     "- Never ask for verification again\n"
+    "{just_verified_instruction}"
     "{repeated_query_instruction}"
     "State: {state}"
 )

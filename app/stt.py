@@ -29,12 +29,14 @@ logger = logging.getLogger("voice_agent")
 STT_URL = "wss://api.cartesia.ai/stt/turns/websocket"
 
 
+# Holds the live streaming STT websocket and its background listener task.
 class InkTurnStream:
     def __init__(self, websocket: Any, listener_task: asyncio.Task[None]) -> None:
         self.websocket = websocket
         self.listener_task = listener_task
 
 
+# Bridges Cartesia turn events into the app's user-turn lifecycle.
 class CartesiaTranscriber:
     def __init__(self) -> None:
         self.api_key = config.CARTESIA_API_KEY
@@ -81,6 +83,7 @@ class CartesiaTranscriber:
         except Exception:
             pass
 
+    # Maps streaming STT events into turn boundaries, speculative work, and final turn handling.
     async def _consume_turn_events(self, stt_ws: Any, twilio_ws: WebSocket, session: CallState) -> None:
         from app.audio import fail_safe_handoff
 
@@ -119,13 +122,16 @@ class CartesiaTranscriber:
                 if event_type == "turn.eager_end":
                     transcript = (message.get("transcript") or "").strip()
                     if transcript and should_speculate_on_transcript(transcript):
-                        session.pending_transcript = transcript
                         start_speculative_task(session, twilio_ws, transcript, time.time())
                     continue
                 if event_type == "turn.end":
                     transcript = (message.get("transcript") or "").strip()
-                    session.current_turn_end_latency_t0 = time.time()
                     logger.info("TURN [%s] USER: %s", session.session_id, transcript)
+                    await log_event(
+                        session.session_id,
+                        "final_turn_end",
+                        {"turn_id": session.current_turn_id},
+                    )
                     await log_event(
                         session.session_id,
                         "asr_result",
@@ -134,7 +140,6 @@ class CartesiaTranscriber:
                     if transcript and should_process_transcript(transcript):
                         if await resolve_speculative_turn(session, twilio_ws, transcript):
                             continue
-                        session.pending_transcript = transcript
                         schedule_response_task(
                             session,
                             handle_completed_turn(session, twilio_ws, transcript, time.time(), speculative=False),

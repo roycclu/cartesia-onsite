@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=100, help="Maximum rows to return. Defaults to 100.")
     parser.add_argument(
         "--view",
-        choices=("joined", "response_started", "asr_result", "turn_outcome", "latency"),
+        choices=("joined", "response_started", "asr_result", "turn_outcome", "latency", "final_turn_end"),
         default="joined",
         help="Which raw view to fetch. Defaults to joined.",
     )
@@ -41,19 +41,19 @@ def build_query(view: str, has_session_id: bool) -> str:
     if view == "joined":
         return f"""
             SELECT
-              a.session_id,
-              a.content::json->>'turn_id' AS turn_id,
-              a.timestamp::timestamptz AS turn_end_ts,
+              f.session_id,
+              f.content::json->>'turn_id' AS turn_id,
+              f.timestamp::timestamptz AS turn_end_ts,
               r.timestamp::timestamptz AS response_started_ts,
-              ROUND(EXTRACT(EPOCH FROM (r.timestamp::timestamptz - a.timestamp::timestamptz)) * 1000)
+              ROUND(EXTRACT(EPOCH FROM (r.timestamp::timestamptz - f.timestamp::timestamptz)) * 1000)
                 AS turn_end_to_response_started_ms
-            FROM compliance_log a
+            FROM compliance_log f
             JOIN compliance_log r
-              ON a.session_id = r.session_id
-             AND a.content::json->>'turn_id' = r.content::json->>'turn_id'
-            WHERE a.event_type = 'asr_result'
+              ON f.session_id = r.session_id
+             AND f.content::json->>'turn_id' = r.content::json->>'turn_id'
+            WHERE f.event_type = 'final_turn_end'
               AND r.event_type = 'response_started'
-              AND a.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
+              AND f.timestamp::timestamptz >= NOW() - make_interval(hours => $1::int)
               {session_clause}
             ORDER BY r.timestamp::timestamptz DESC
             LIMIT $2
